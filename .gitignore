@@ -1,0 +1,26 @@
+# Fichiers générés / temporaires
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Fichiers de sortie et de test
+resultats_LEI.xlsx
+gleif_test_sample.csv
+
+# Fichier de version locale GLEIF (propre à chaque poste)
+.gleif_version.json
+
+# Préférences utilisateur locales
+.gleif_matcher_prefs.json
+
+# Base GLEIF (trop volumineuse pour git)
+gleif_golden_copy*.csv
+gleif_golden_copy*.json
+gleif_golden_copy*.zip
+gleif_golden_copy_download.zip
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini

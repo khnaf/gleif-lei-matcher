@@ -1,0 +1,16 @@
+{
+    "_commentaire": "Configuration partagée GLEIF LEI Matcher — modifiable par le gestionnaire du projet.",
+
+    "gleif_path": "",
+    "_gleif_path_info": "Chemin vers le fichier Golden Copy GLEIF (ex: \\\\serveur\\partage\\GLEIF\\gleif_golden_copy.csv). Laisser vide si chaque utilisateur sélectionne le fichier manuellement.",
+
+    "col_rcs":  "RCS",
+    "col_name": "NomEntreprise",
+    "col_pays": "Pays",
+
+    "fuzzy_threshold": 80,
+    "_fuzzy_threshold_info": "Seuil de similarité pour la correspondance par nom (0-100). 80 recommandé.",
+
+    "active_only": true,
+    "_active_only_info": "true = seulement les LEI actifs (Entity=ACTIVE et LEI=ISSUED). false = tous statuts."
+}
