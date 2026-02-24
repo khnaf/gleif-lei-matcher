@@ -8,43 +8,33 @@ Workflow :
   2. Si non trouvé → fuzzy matching par nom d'entreprise + pays
   3. Export Excel enrichi avec colonnes LEI, statut, type de correspondance
 
-Usage :
-  python gleif_matcher.py \
-      --input     societes.xlsx \
-      --gleif     gleif_golden_copy.csv \
-      --output    resultats_LEI.xlsx \
-      [--col-rcs  RCS] \
-      [--col-name NomEntreprise] \
-      [--col-pays Pays] \
-      [--fuzzy-threshold 80] \
-      [--active-only]
+Usage CLI :
+  python gleif_matcher.py --input societes.xlsx --gleif gleif_golden_copy.csv --output resultats.xlsx
 
-Colonnes GLEIF attendues (Golden Copy CSV) :
+Colonnes GLEIF attendues (Golden Copy CSV) — variantes gérées automatiquement :
   LEI, Entity.LegalName, Entity.LegalAddress.Country,
   Entity.EntityStatus, Registration.RegistrationStatus,
-  Registration.RegistrationAuthorityID,
-  Registration.RegistrationAuthorityEntityID
+  Registration.RegistrationAuthorityID  (ou Entity.RegistrationAuthority.*)
+  Registration.RegistrationAuthorityEntityID (ou Entity.RegistrationAuthority.*)
 
-Statuts importants :
-  Entity.EntityStatus          → statut de la SOCIÉTÉ  : ACTIVE / INACTIVE / MERGED
-  Registration.RegistrationStatus → statut du LEI        : ISSUED / LAPSED / RETIRED / …
-  Le filtre --active-only applique les deux : EntityStatus=ACTIVE ET RegistrationStatus=ISSUED
+Statuts :
+  Entity.EntityStatus             → ACTIVE / INACTIVE / MERGED  (statut société)
+  Registration.RegistrationStatus → ISSUED / LAPSED / RETIRED   (statut LEI)
 """
 
 import argparse
 import logging
 import re
 import sys
+import shutil
+import tempfile
 import unicodedata
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
 from rapidfuzz import fuzz, process
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -52,156 +42,168 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Mapping pays → code ISO 3166-1 alpha-2
-# (noms français + anglais les plus courants)
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Mapping pays → ISO 3166-1 alpha-2
+# ─────────────────────────────────────────────────────────────────────────────
 COUNTRY_MAP: Dict[str, str] = {
-    # France
     "france": "FR", "fr": "FR",
-    # Allemagne
     "allemagne": "DE", "germany": "DE", "de": "DE",
-    # Italie
     "italie": "IT", "italy": "IT", "it": "IT",
-    # Espagne
     "espagne": "ES", "spain": "ES", "es": "ES",
-    # Belgique
     "belgique": "BE", "belgium": "BE", "be": "BE",
-    # Suisse
     "suisse": "CH", "switzerland": "CH", "ch": "CH",
-    # Luxembourg
     "luxembourg": "LU", "lu": "LU",
-    # Pays-Bas
     "pays-bas": "NL", "netherlands": "NL", "nl": "NL", "hollande": "NL",
-    # Royaume-Uni
     "royaume-uni": "GB", "united kingdom": "GB", "uk": "GB", "gb": "GB",
     "angleterre": "GB", "england": "GB",
-    # États-Unis
-    "etats-unis": "US", "états-unis": "US", "united states": "US",
-    "usa": "US", "us": "US",
-    # Portugal
+    "etats-unis": "US", "états-unis": "US", "united states": "US", "usa": "US", "us": "US",
     "portugal": "PT", "pt": "PT",
-    # Autriche
     "autriche": "AT", "austria": "AT", "at": "AT",
-    # Suède
     "suede": "SE", "suède": "SE", "sweden": "SE", "se": "SE",
-    # Danemark
     "danemark": "DK", "denmark": "DK", "dk": "DK",
-    # Norvège
     "norvege": "NO", "norvège": "NO", "norway": "NO", "no": "NO",
-    # Finlande
     "finlande": "FI", "finland": "FI", "fi": "FI",
-    # Pologne
     "pologne": "PL", "poland": "PL", "pl": "PL",
-    # République tchèque
-    "republique tcheque": "CZ", "czech republic": "CZ",
-    "czechia": "CZ", "cz": "CZ",
-    # Irlande
+    "republique tcheque": "CZ", "czech republic": "CZ", "czechia": "CZ", "cz": "CZ",
     "irlande": "IE", "ireland": "IE", "ie": "IE",
-    # Grèce
     "grece": "GR", "grèce": "GR", "greece": "GR", "gr": "GR",
-    # Roumanie
     "roumanie": "RO", "romania": "RO", "ro": "RO",
-    # Hongrie
     "hongrie": "HU", "hungary": "HU", "hu": "HU",
-    # Japon
     "japon": "JP", "japan": "JP", "jp": "JP",
-    # Chine
     "chine": "CN", "china": "CN", "cn": "CN",
-    # Canada
     "canada": "CA", "ca": "CA",
-    # Australie
     "australie": "AU", "australia": "AU", "au": "AU",
-    # Singapore
     "singapour": "SG", "singapore": "SG", "sg": "SG",
-    # Emirats arabes unis
     "emirats arabes unis": "AE", "uae": "AE", "ae": "AE",
-    # Monaco
     "monaco": "MC", "mc": "MC",
-    # Liechtenstein
     "liechtenstein": "LI", "li": "LI",
-    # Andorre
     "andorre": "AD", "andorra": "AD", "ad": "AD",
-    # Ile Maurice
     "ile maurice": "MU", "mauritius": "MU", "mu": "MU",
-    # Maroc
     "maroc": "MA", "morocco": "MA", "ma": "MA",
 }
 
-# Codes ISO déjà valides (2 lettres maj)
 _ISO_PATTERN = re.compile(r"^[A-Z]{2}$")
 
-# Formes juridiques à retirer lors de la normalisation des noms
-_LEGAL_FORMS = (
-    r"\bS\.?A\.?S\.?U?\b", r"\bS\.?A\.?R\.?L\.?\b", r"\bS\.?A\.?\b",
-    r"\bS\.?N\.?C\.?\b", r"\bS\.?C\.?I\.?\b", r"\bE\.?U\.?R\.?L\.?\b",
-    r"\bG\.?I\.?E\.?\b", r"\bS\.?C\.?M\.?\b", r"\bS\.?C\.?P\.?\b",
-    r"\bS\.?C\.?S\.?\b", r"\bS\.?C\.?\b", r"\bG\.?M\.?B\.?H\.?\b",
-    r"\bA\.?G\.?\b", r"\bL\.?T\.?D\.?\b", r"\bP\.?L\.?C\.?\b",
-    r"\bI\.?N\.?C\.?\b", r"\bL\.?L\.?C\.?\b", r"\bB\.?V\.?\b",
-    r"\bN\.?V\.?\b", r"\bS\.?P\.?A\.?\b", r"\bS\.?R\.?L\.?\b",
+_LEGAL_FORMS_RE = re.compile(
+    r"\bS\.?A\.?S\.?U?\b|\bS\.?A\.?R\.?L\.?\b|\bS\.?A\.?\b"
+    r"|\bS\.?N\.?C\.?\b|\bS\.?C\.?I\.?\b|\bE\.?U\.?R\.?L\.?\b"
+    r"|\bG\.?I\.?E\.?\b|\bS\.?C\.?M\.?\b|\bS\.?C\.?P\.?\b"
+    r"|\bS\.?C\.?S\.?\b|\bS\.?C\.?\b|\bG\.?M\.?B\.?H\.?\b"
+    r"|\bA\.?G\.?\b|\bS\.?E\.?\b|\bL\.?T\.?D\.?\b|\bP\.?L\.?C\.?\b"
+    r"|\bI\.?N\.?C\.?\b|\bL\.?L\.?C\.?\b|\bB\.?V\.?\b"
+    r"|\bN\.?V\.?\b|\bS\.?P\.?A\.?\b|\bS\.?R\.?L\.?\b",
+    re.IGNORECASE,
 )
-_LEGAL_FORMS_RE = re.compile("|".join(_LEGAL_FORMS), re.IGNORECASE)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Schéma GLEIF — candidats par ordre de priorité pour chaque colonne logique
+# Gère les variantes de nommage entre versions du Golden Copy
+# ─────────────────────────────────────────────────────────────────────────────
+GLEIF_COLUMN_CANDIDATES: Dict[str, List[str]] = {
+    "lei": [
+        "LEI",
+    ],
+    "name": [
+        "Entity.LegalName",
+        "Entity.LegalName.name",
+    ],
+    "country": [
+        "Entity.LegalAddress.Country",
+        "Entity.LegalAddress.country",
+    ],
+    "entity_status": [
+        "Entity.EntityStatus",
+        "Entity.Status",
+    ],
+    "lei_status": [
+        "Registration.RegistrationStatus",
+        "Registration.Status",
+    ],
+    "ra_id": [
+        "Registration.RegistrationAuthorityID",
+        "Entity.RegistrationAuthority.RegistrationAuthorityID",
+        "Registration.RegistrationAuthority.RegistrationAuthorityID",
+        "RegistrationAuthority.RegistrationAuthorityID",
+    ],
+    "ra_entity": [
+        "Registration.RegistrationAuthorityEntityID",
+        "Entity.RegistrationAuthority.RegistrationAuthorityEntityID",
+        "Registration.RegistrationAuthority.RegistrationAuthorityEntityID",
+        "RegistrationAuthority.RegistrationAuthorityEntityID",
+    ],
+}
+
+# Noms standardisés dans le DataFrame interne et dans le slim CSV
+SLIM_COLUMNS = list(GLEIF_COLUMN_CANDIDATES.keys())  # ordre stable
+
+# Taille des chunks pour la lecture du CSV complet (~450 Mo)
+GLEIF_CHUNK_SIZE = 100_000
 
 
-# ---------------------------------------------------------------------------
-# Fonctions utilitaires
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Détection du schéma réel du fichier GLEIF
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _detect_gleif_columns(available_cols: List[str]) -> Tuple[Dict[str, str], List[str]]:
+    """
+    Mappe les colonnes logiques vers les noms réels présents dans le fichier.
+
+    Retourne :
+      col_map  : {logical_name → actual_column_name}   pour les colonnes trouvées
+      missing  : liste des colonnes logiques non trouvées (non bloquant)
+    """
+    available_set = set(available_cols)
+    col_map: Dict[str, str] = {}
+    missing: List[str] = []
+
+    for logical, candidates in GLEIF_COLUMN_CANDIDATES.items():
+        found = next((c for c in candidates if c in available_set), None)
+        if found:
+            col_map[logical] = found
+        else:
+            missing.append(logical)
+            log.warning(
+                f"Colonne GLEIF non trouvée : '{logical}' "
+                f"(candidats essayés : {candidates}). Colonne laissée vide."
+            )
+
+    log.info(f"Mapping colonnes GLEIF : { {k: v for k, v in col_map.items()} }")
+    if missing:
+        log.warning(f"Colonnes absentes (seront vides) : {missing}")
+
+    return col_map, missing
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Normalisation
+# ─────────────────────────────────────────────────────────────────────────────
 
 def normalize_rcs(value) -> str:
-    """
-    Normalise un numéro RCS/SIREN en conservant uniquement les chiffres
-    et lettres (supprime espaces, points, tirets, slash, etc.).
-
-    Ex : "RCS Paris 123 456 789" → "123456789"
-         "123.456.789 B"         → "123456789B"
-    """
     if pd.isna(value) or str(value).strip() == "":
         return ""
     raw = str(value).upper()
-    # Supprimer le préfixe "RCS <ville>" éventuel
     raw = re.sub(r"^RCS\s+[A-ZÉÈÀÂÊÎÔÙÛÇ\s]+\s+", "", raw).strip()
-    # Garder uniquement alphanumériques
     return re.sub(r"[^0-9A-Z]", "", raw)
 
 
 def normalize_name(value) -> str:
-    """
-    Normalise un nom d'entreprise pour la comparaison :
-    - Majuscules
-    - Suppression des accents
-    - Suppression des formes juridiques courantes
-    - Suppression des caractères spéciaux et espaces multiples
-    """
     if pd.isna(value) or str(value).strip() == "":
         return ""
     name = str(value).upper()
-    # Supprimer les accents
     name = unicodedata.normalize("NFD", name)
     name = "".join(c for c in name if unicodedata.category(c) != "Mn")
-    # Supprimer les formes juridiques
     name = _LEGAL_FORMS_RE.sub(" ", name)
-    # Supprimer la ponctuation sauf espaces
     name = re.sub(r"[^A-Z0-9\s]", " ", name)
-    # Compresser les espaces
     return re.sub(r"\s+", " ", name).strip()
 
 
 def country_to_iso(value) -> str:
-    """
-    Convertit un nom de pays (français ou anglais) ou un code ISO
-    en code ISO 3166-1 alpha-2 en majuscules.
-    Retourne '' si non reconnu.
-    """
     if pd.isna(value) or str(value).strip() == "":
         return ""
     raw = str(value).strip().upper()
-    # Déjà un code ISO à 2 lettres
     if _ISO_PATTERN.match(raw):
         return raw
-    # Chercher dans le mapping (clé en minuscules)
     key = raw.lower()
-    # Supprimer les accents pour la recherche
     key_no_accent = "".join(
         c for c in unicodedata.normalize("NFD", key)
         if unicodedata.category(c) != "Mn"
@@ -209,105 +211,273 @@ def country_to_iso(value) -> str:
     return COUNTRY_MAP.get(key_no_accent, COUNTRY_MAP.get(key, ""))
 
 
-# ---------------------------------------------------------------------------
-# Chargement de la base GLEIF
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Lecture sécurisée d'un fichier Excel (gestion OneDrive Entreprise)
+# ─────────────────────────────────────────────────────────────────────────────
 
-GLEIF_COLS = {
-    "lei":          "LEI",
-    "name":         "Entity.LegalName",
-    "country":      "Entity.LegalAddress.Country",
-    "entity_status":"Entity.EntityStatus",          # statut de la SOCIÉTÉ
-    "lei_status":   "Registration.RegistrationStatus",  # statut du LEI
-    "ra_id":        "Registration.RegistrationAuthorityID",
-    "ra_entity":    "Registration.RegistrationAuthorityEntityID",
-}
-
-
-def load_gleif(gleif_path: str, active_only: bool = True) -> pd.DataFrame:
+def _safe_read_excel(path: str) -> pd.DataFrame:
     """
-    Charge le fichier Golden Copy GLEIF (CSV ou JSON).
+    Lit un fichier Excel en gérant les erreurs de permission OneDrive.
+
+    Si PermissionError détecté (fichier cloud-only ou verrouillé par OneDrive),
+    copie le fichier dans %TEMP%\\gleif_match\\ avant lecture.
+    """
+    p = Path(path)
+    try:
+        return pd.read_excel(path, dtype=str)
+    except PermissionError:
+        is_onedrive = "onedrive" in str(p).lower()
+        if is_onedrive:
+            log.warning(
+                "Fichier OneDrive Entreprise inaccessible (cloud-only ou verrouillé). "
+                "Copie temporaire en cours..."
+            )
+        else:
+            log.warning(f"Permission refusée sur '{p.name}'. Tentative via copie temp...")
+
+        tmp_dir = Path(tempfile.gettempdir()) / "gleif_match"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        tmp_path = tmp_dir / p.name
+        shutil.copy2(path, str(tmp_path))
+        log.info(f"Lecture depuis copie temporaire : {tmp_path}")
+        return pd.read_excel(str(tmp_path), dtype=str)
+    except Exception:
+        raise
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Chargement GLEIF — lecture en chunks pour gérer les ~450 Mo
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_gleif(
+    gleif_path: str,
+    active_only: bool = True,
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+    status_cb: Optional[Callable[[str], None]] = None,
+) -> pd.DataFrame:
+    """
+    Charge le fichier Golden Copy GLEIF (CSV ou JSON) en mémoire minimale.
+
+    Stratégie CSV :
+      1. Lecture de l'en-tête uniquement pour détecter le schéma réel
+      2. Construction de la liste usecols avec les colonnes effectivement présentes
+      3. Lecture en chunks (GLEIF_CHUNK_SIZE lignes) avec filtrage à la volée
+      4. Concaténation des chunks filtrés → DataFrame final compact
 
     Paramètres
     ----------
-    gleif_path  : chemin vers le fichier GLEIF téléchargé
-    active_only : si True, ne charge que les entités avec EntityStatus=ACTIVE
-
-    Retourne un DataFrame avec les colonnes normalisées.
+    gleif_path  : chemin vers le fichier GLEIF (CSV ou JSON)
+    active_only : filtre Entity=ACTIVE et LEI=ISSUED
+    progress_cb : callback(chunks_lus, total_estimé)  [optionnel]
+    status_cb   : callback(message_texte)             [optionnel]
     """
+    def _status(msg: str):
+        log.info(msg)
+        if status_cb:
+            status_cb(msg)
+
     path = Path(gleif_path)
-    log.info(f"Chargement GLEIF depuis : {path.name} …")
-
     suffix = path.suffix.lower()
+    _status(f"Chargement GLEIF : {path.name} …")
 
-    if suffix == ".csv":
-        df = pd.read_csv(
-            gleif_path,
-            usecols=list(GLEIF_COLS.values()),
-            dtype=str,
-            low_memory=False,
-        )
-    elif suffix == ".json":
+    # ── JSON ──────────────────────────────────────────────────────────────────
+    if suffix == ".json":
+        _status("Format JSON — lecture complète en mémoire…")
         raw = pd.read_json(gleif_path, dtype=str)
-        # Le JSON GLEIF peut avoir une structure imbriquée – on tente un flatten
         if "LEI" not in raw.columns:
             raw = pd.json_normalize(raw.to_dict(orient="records"))
-        df = raw[[c for c in GLEIF_COLS.values() if c in raw.columns]]
-    else:
-        raise ValueError(f"Format non supporté : {suffix}. Utilisez CSV ou JSON.")
+        return _finalize_gleif_df(raw, active_only)
 
-    # Renommer pour faciliter l'usage interne
-    df = df.rename(columns={v: k for k, v in GLEIF_COLS.items()})
+    # ── CSV — lecture en chunks ───────────────────────────────────────────────
+    # Étape 1 : détecter le schéma en lisant uniquement la première ligne
+    header_df = pd.read_csv(gleif_path, nrows=0, dtype=str, low_memory=False)
+    available_cols = list(header_df.columns)
+    col_map, _missing = _detect_gleif_columns(available_cols)
 
-    # S'assurer que toutes les colonnes existent
-    for col in GLEIF_COLS:
-        if col not in df.columns:
-            df[col] = ""
+    # Colonnes à lire (uniquement celles trouvées → réduit la mémoire ~10x)
+    usecols = list(set(col_map.values()))
+    _status(f"Colonnes retenues : {len(usecols)} / {len(available_cols)} — lecture par chunks…")
 
-    df = df.fillna("")
+    # Estimation de la taille totale pour la progression
+    try:
+        file_size = path.stat().st_size
+        # Estimation grossière : ~200 octets par ligne dans le CSV complet
+        estimated_total_chunks = max(1, file_size // (200 * GLEIF_CHUNK_SIZE))
+    except Exception:
+        estimated_total_chunks = 200  # fallback
 
+    # Étape 2 : lecture chunked
+    chunks: List[pd.DataFrame] = []
+    chunks_read = 0
+
+    reader = pd.read_csv(
+        gleif_path,
+        usecols=usecols,
+        dtype=str,
+        low_memory=False,
+        chunksize=GLEIF_CHUNK_SIZE,
+        on_bad_lines="skip",   # ignore les lignes malformées plutôt que crash
+    )
+
+    for chunk in reader:
+        # Renommer vers les noms logiques standardisés
+        rename_map = {v: k for k, v in col_map.items()}
+        chunk = chunk.rename(columns=rename_map)
+
+        # Ajouter les colonnes absentes (non trouvées dans le schéma)
+        for logical in SLIM_COLUMNS:
+            if logical not in chunk.columns:
+                chunk[logical] = ""
+
+        chunk = chunk[SLIM_COLUMNS].fillna("")
+
+        # Filtrage à la volée (évite d'accumuler des données inutiles)
+        if active_only:
+            mask = (
+                (chunk["entity_status"].str.upper() == "ACTIVE") &
+                (chunk["lei_status"].str.upper() == "ISSUED")
+            )
+            chunk = chunk[mask]
+
+        if not chunk.empty:
+            chunks.append(chunk)
+
+        chunks_read += 1
+        if progress_cb:
+            progress_cb(chunks_read, estimated_total_chunks)
+
+    if not chunks:
+        log.warning("Aucune entité retenue après filtrage.")
+        return pd.DataFrame(columns=SLIM_COLUMNS)
+
+    df = pd.concat(chunks, ignore_index=True)
+
+    n_total = chunks_read * GLEIF_CHUNK_SIZE
+    _status(
+        f"  Chargement terminé : {len(df):,} entités retenues "
+        f"({'filtre ACTIVE+ISSUED' if active_only else 'tous statuts'})"
+    )
+    return df
+
+
+def _finalize_gleif_df(raw: pd.DataFrame, active_only: bool) -> pd.DataFrame:
+    """Post-traitement commun pour le JSON et les petits CSV."""
+    col_map, _ = _detect_gleif_columns(list(raw.columns))
+    rename_map = {v: k for k, v in col_map.items()}
+    df = raw.rename(columns=rename_map)
+    for logical in SLIM_COLUMNS:
+        if logical not in df.columns:
+            df[logical] = ""
+    df = df[SLIM_COLUMNS].fillna("")
     if active_only:
-        before = len(df)
-        # Double filtre :
-        #   Entity.EntityStatus          == ACTIVE  → société encore existante
-        #   Registration.RegistrationStatus == ISSUED  → LEI valide et à jour
         mask = (
             (df["entity_status"].str.upper() == "ACTIVE") &
             (df["lei_status"].str.upper() == "ISSUED")
         )
-        df = df[mask].copy()
-        log.info(
-            f"  Filtre Entity=ACTIVE + LEI=ISSUED : {before:,} → {len(df):,} entités"
-        )
-    else:
-        log.info(f"  Entités chargées (tous statuts) : {len(df):,}")
-
+        df = df[mask]
     return df.reset_index(drop=True)
 
 
-# ---------------------------------------------------------------------------
-# Construction des index
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Préparation d'une base SLIM (CSV léger, colonnes essentielles, filtrée)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def prepare_slim(
+    input_csv: str,
+    output_csv: str,
+    active_only: bool = True,
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+    status_cb: Optional[Callable[[str], None]] = None,
+) -> int:
+    """
+    Génère un CSV allégé depuis le Golden Copy complet.
+
+    Le slim CSV ne contient que les 7 colonnes utiles et (optionnellement)
+    uniquement les entités ACTIVE + ISSUED. Taille typique : 200-400 Mo → 80-150 Mo.
+
+    Retourne le nombre de lignes écrites.
+    """
+    def _status(msg: str):
+        log.info(msg)
+        if status_cb:
+            status_cb(msg)
+
+    path_in = Path(input_csv)
+    path_out = Path(output_csv)
+
+    _status(f"Préparation base slim : {path_in.name} → {path_out.name} …")
+
+    header_df = pd.read_csv(str(path_in), nrows=0, dtype=str, low_memory=False)
+    col_map, _ = _detect_gleif_columns(list(header_df.columns))
+    usecols = list(set(col_map.values()))
+
+    try:
+        file_size = path_in.stat().st_size
+        estimated_chunks = max(1, file_size // (200 * GLEIF_CHUNK_SIZE))
+    except Exception:
+        estimated_chunks = 200
+
+    reader = pd.read_csv(
+        str(path_in),
+        usecols=usecols,
+        dtype=str,
+        low_memory=False,
+        chunksize=GLEIF_CHUNK_SIZE,
+        on_bad_lines="skip",
+    )
+
+    total_written = 0
+    chunks_read = 0
+    first_chunk = True
+
+    for chunk in reader:
+        rename_map = {v: k for k, v in col_map.items()}
+        chunk = chunk.rename(columns=rename_map)
+        for logical in SLIM_COLUMNS:
+            if logical not in chunk.columns:
+                chunk[logical] = ""
+        chunk = chunk[SLIM_COLUMNS].fillna("")
+
+        if active_only:
+            mask = (
+                (chunk["entity_status"].str.upper() == "ACTIVE") &
+                (chunk["lei_status"].str.upper() == "ISSUED")
+            )
+            chunk = chunk[mask]
+
+        if not chunk.empty:
+            chunk.to_csv(
+                str(path_out),
+                mode="w" if first_chunk else "a",
+                header=first_chunk,
+                index=False,
+                encoding="utf-8",
+            )
+            total_written += len(chunk)
+            first_chunk = False
+
+        chunks_read += 1
+        if progress_cb:
+            progress_cb(chunks_read, estimated_chunks)
+
+    _status(f"Base slim générée : {total_written:,} entités → {path_out.name}")
+    return total_written
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Index de recherche
+# ─────────────────────────────────────────────────────────────────────────────
 
 def build_indices(
     df: pd.DataFrame,
 ) -> Tuple[Dict[str, List[int]], Dict[str, Dict[str, List[int]]]]:
-    """
-    Construit deux index pour accélérer la recherche :
-
-    rcs_index   : { rcs_normalisé → [indices dans df] }
-    name_index  : { code_pays → { nom_normalisé → [indices dans df] } }
-    """
     log.info("Construction des index …")
-
-    # --- Index RCS ---
     rcs_index: Dict[str, List[int]] = {}
     for i, row in enumerate(df["ra_entity"]):
         key = normalize_rcs(row)
         if key:
             rcs_index.setdefault(key, []).append(i)
 
-    # --- Index nom/pays ---
     name_index: Dict[str, Dict[str, List[int]]] = {}
     for i, (country, name) in enumerate(zip(df["country"], df["name"])):
         c = str(country).strip().upper()
@@ -322,20 +492,15 @@ def build_indices(
     return rcs_index, name_index
 
 
-# ---------------------------------------------------------------------------
-# Fonctions de recherche
-# ---------------------------------------------------------------------------
-
 def search_by_rcs(
-    rcs_norm: str, rcs_index: Dict[str, List[int]], df: pd.DataFrame
+    rcs_norm: str,
+    rcs_index: Dict[str, List[int]],
+    df: pd.DataFrame,
 ) -> Optional[pd.Series]:
-    """Recherche exacte par RCS normalisé. Retourne la première ligne trouvée."""
     if not rcs_norm:
         return None
     indices = rcs_index.get(rcs_norm)
-    if indices:
-        return df.iloc[indices[0]]
-    return None
+    return df.iloc[indices[0]] if indices else None
 
 
 def search_by_name_country(
@@ -345,37 +510,26 @@ def search_by_name_country(
     df: pd.DataFrame,
     threshold: int = 80,
 ) -> Tuple[Optional[pd.Series], int]:
-    """
-    Recherche fuzzy par nom normalisé + pays ISO.
-
-    Retourne (ligne_gleif, score) ou (None, 0) si aucune correspondance
-    n'atteint le seuil.
-    """
     if not name_norm or not iso_country:
         return None, 0
-
     country_names = name_index.get(iso_country, {})
     if not country_names:
         return None, 0
-
-    candidates = list(country_names.keys())
     result = process.extractOne(
         name_norm,
-        candidates,
+        list(country_names.keys()),
         scorer=fuzz.token_sort_ratio,
         score_cutoff=threshold,
     )
     if result is None:
         return None, 0
-
     best_name, score, _ = result
-    indices = country_names[best_name]
-    return df.iloc[indices[0]], int(score)
+    return df.iloc[country_names[best_name][0]], int(score)
 
 
-# ---------------------------------------------------------------------------
-# Pipeline principal
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Pipeline de rapprochement principal
+# ─────────────────────────────────────────────────────────────────────────────
 
 def match_companies(
     input_path: str,
@@ -386,58 +540,55 @@ def match_companies(
     col_pays: str = "Pays",
     fuzzy_threshold: int = 80,
     active_only: bool = True,
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+    status_cb: Optional[Callable[[str], None]] = None,
 ) -> pd.DataFrame:
-    """
-    Charge le fichier d'entrée, effectue le rapprochement GLEIF,
-    et exporte le résultat enrichi en Excel.
 
-    Retourne le DataFrame résultat.
-    """
-    # 1. Charger le fichier d'entrée
-    log.info(f"Lecture du fichier d'entrée : {input_path}")
-    df_input = pd.read_excel(input_path, dtype=str)
-    df_input = df_input.fillna("")
-    log.info(f"  {len(df_input):,} lignes chargées")
+    def _status(msg):
+        log.info(msg)
+        if status_cb:
+            status_cb(msg)
 
-    # Vérifier les colonnes
-    missing = [c for c in [col_rcs, col_name, col_pays] if c not in df_input.columns]
-    if missing:
+    _status(f"Lecture du fichier d'entrée : {input_path}")
+    df_input = _safe_read_excel(input_path).fillna("")
+    _status(f"  {len(df_input):,} lignes chargées")
+
+    missing_cols = [c for c in [col_rcs, col_name, col_pays] if c not in df_input.columns]
+    if missing_cols:
         raise ValueError(
-            f"Colonnes manquantes dans le fichier d'entrée : {missing}\n"
+            f"Colonnes manquantes dans le fichier d'entrée : {missing_cols}\n"
             f"Colonnes disponibles : {list(df_input.columns)}"
         )
 
-    # 2. Charger GLEIF
-    df_gleif = load_gleif(gleif_path, active_only=active_only)
-
-    # 3. Construire les index
+    df_gleif = load_gleif(
+        gleif_path,
+        active_only=active_only,
+        status_cb=status_cb,
+    )
     rcs_index, name_index = build_indices(df_gleif)
 
-    # 4. Rapprochement ligne par ligne
     results = []
-    log.info("Rapprochement en cours …")
+    n_total = len(df_input)
+    n_exact = n_approx = n_miss = 0
+
+    _status("Rapprochement en cours …")
 
     for idx, row in df_input.iterrows():
-        rcs_raw   = str(row[col_rcs]).strip()
-        name_raw  = str(row[col_name]).strip()
-        pays_raw  = str(row[col_pays]).strip()
-
-        rcs_norm   = normalize_rcs(rcs_raw)
-        name_norm  = normalize_name(name_raw)
-        iso        = country_to_iso(pays_raw) if pays_raw else ""
+        rcs_norm  = normalize_rcs(str(row[col_rcs]))
+        name_norm = normalize_name(str(row[col_name]))
+        iso       = country_to_iso(str(row[col_pays]))
 
         gleif_row  = None
         match_type = "Non trouvé"
         match_score = ""
 
-        # -- Étape 1 : correspondance exacte par RCS --
         if rcs_norm:
             gleif_row = search_by_rcs(rcs_norm, rcs_index, df_gleif)
             if gleif_row is not None:
                 match_type  = "Exact – RCS"
                 match_score = 100
+                n_exact    += 1
 
-        # -- Étape 2 : fuzzy matching par nom + pays --
         if gleif_row is None and name_norm:
             gleif_row, score = search_by_name_country(
                 name_norm, iso, name_index, df_gleif, fuzzy_threshold
@@ -445,70 +596,56 @@ def match_companies(
             if gleif_row is not None:
                 match_type  = "Approx – Nom/Pays"
                 match_score = score
+                n_approx   += 1
 
-        # Construire la ligne de résultat
+        if gleif_row is None:
+            n_miss += 1
+
         if gleif_row is not None:
-            results.append(
-                {
-                    "LEI":                      gleif_row["lei"],
-                    "GLEIF_NomLegal":           gleif_row["name"],
-                    "GLEIF_Pays":               gleif_row["country"],
-                    "GLEIF_StatutSociete":      gleif_row["entity_status"],   # ACTIVE / INACTIVE
-                    "GLEIF_StatutLEI":          gleif_row["lei_status"],       # ISSUED / LAPSED
-                    "GLEIF_AutoriteRegistre":   gleif_row["ra_id"],
-                    "GLEIF_NumRegistre":        gleif_row["ra_entity"],
-                    "TypeCorrespondance":       match_type,
-                    "ScoreCorrespondance":      match_score,
-                }
-            )
+            results.append({
+                "LEI":                    gleif_row["lei"],
+                "GLEIF_NomLegal":         gleif_row["name"],
+                "GLEIF_Pays":             gleif_row["country"],
+                "GLEIF_StatutSociete":    gleif_row["entity_status"],
+                "GLEIF_StatutLEI":        gleif_row["lei_status"],
+                "GLEIF_AutoriteRegistre": gleif_row["ra_id"],
+                "GLEIF_NumRegistre":      gleif_row["ra_entity"],
+                "TypeCorrespondance":     match_type,
+                "ScoreCorrespondance":    match_score,
+            })
         else:
-            results.append(
-                {
-                    "LEI":                     "",
-                    "GLEIF_NomLegal":          "",
-                    "GLEIF_Pays":             "",
-                    "GLEIF_StatutSociete":    "",
-                    "GLEIF_StatutLEI":        "",
-                    "GLEIF_AutoriteRegistre": "",
-                    "GLEIF_NumRegistre":      "",
-                    "TypeCorrespondance":     match_type,
-                    "ScoreCorrespondance":    "",
-                }
-            )
+            results.append({
+                "LEI": "", "GLEIF_NomLegal": "", "GLEIF_Pays": "",
+                "GLEIF_StatutSociete": "", "GLEIF_StatutLEI": "",
+                "GLEIF_AutoriteRegistre": "", "GLEIF_NumRegistre": "",
+                "TypeCorrespondance": match_type, "ScoreCorrespondance": "",
+            })
 
-        if (idx + 1) % 100 == 0:
-            log.info(f"  {idx + 1}/{len(df_input)} lignes traitées …")
+        if progress_cb and ((idx + 1) % 10 == 0 or (idx + 1) == n_total):
+            progress_cb(idx + 1, n_total)
 
-    # 5. Assembler le DataFrame résultat
     df_results = pd.DataFrame(results)
     df_output  = pd.concat([df_input.reset_index(drop=True), df_results], axis=1)
 
-    # 6. Export Excel avec mise en forme
-    log.info(f"Export vers : {output_path}")
+    _status(f"Export vers : {output_path}")
     _export_excel(df_output, output_path, fuzzy_threshold)
 
-    # Statistiques
-    n_exact  = (df_results["TypeCorrespondance"] == "Exact – RCS").sum()
-    n_approx = (df_results["TypeCorrespondance"] == "Approx – Nom/Pays").sum()
-    n_miss   = (df_results["TypeCorrespondance"] == "Non trouvé").sum()
     log.info(
         f"\n{'='*50}\n"
-        f"  Total lignes          : {len(df_input):>6,}\n"
-        f"  Exact – RCS           : {n_exact:>6,}  ({n_exact/len(df_input)*100:.1f}%)\n"
-        f"  Approx – Nom/Pays     : {n_approx:>6,}  ({n_approx/len(df_input)*100:.1f}%)\n"
-        f"  Non trouvé            : {n_miss:>6,}  ({n_miss/len(df_input)*100:.1f}%)\n"
+        f"  Total        : {n_total:>6,}\n"
+        f"  Exact RCS    : {n_exact:>6,}  ({n_exact/n_total*100:.1f}%)\n"
+        f"  Approx Nom   : {n_approx:>6,}  ({n_approx/n_total*100:.1f}%)\n"
+        f"  Non trouvé   : {n_miss:>6,}  ({n_miss/n_total*100:.1f}%)\n"
         f"{'='*50}"
     )
-
     return df_output
 
 
-# ---------------------------------------------------------------------------
-# Export Excel avec couleurs
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Export Excel
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _export_excel(df: pd.DataFrame, output_path: str, threshold: int) -> None:
-    """Exporte le DataFrame en Excel avec mise en forme conditionnelle."""
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
@@ -517,126 +654,111 @@ def _export_excel(df: pd.DataFrame, output_path: str, threshold: int) -> None:
     ws = wb.active
     ws.title = "Résultats LEI"
 
-    # Couleurs
-    HEADER_FILL   = PatternFill("solid", fgColor="1F4E79")   # bleu foncé
-    GLEIF_FILL    = PatternFill("solid", fgColor="D6E4F0")   # bleu clair
-    EXACT_FILL    = PatternFill("solid", fgColor="D9EAD3")   # vert clair
-    APPROX_FILL   = PatternFill("solid", fgColor="FFF2CC")   # jaune
-    MISS_FILL     = PatternFill("solid", fgColor="FCE4D6")   # rouge clair
+    HEADER_FILL = PatternFill("solid", fgColor="1F4E79")
+    GLEIF_FILL  = PatternFill("solid", fgColor="D6E4F0")
+    EXACT_FILL  = PatternFill("solid", fgColor="D9EAD3")
+    APPROX_FILL = PatternFill("solid", fgColor="FFF2CC")
+    MISS_FILL   = PatternFill("solid", fgColor="FCE4D6")
 
-    thin = Side(style="thin", color="AAAAAA")
+    thin   = Side(style="thin", color="AAAAAA")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    hfont  = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+    dfont  = Font(name="Arial", size=10)
 
-    header_font = Font(name="Arial", bold=True, color="FFFFFF", size=10)
-    data_font   = Font(name="Arial", size=10)
-
-    # Identifier les colonnes enrichies GLEIF
     gleif_cols = [
         "LEI", "GLEIF_NomLegal", "GLEIF_Pays",
         "GLEIF_StatutSociete", "GLEIF_StatutLEI",
         "GLEIF_AutoriteRegistre", "GLEIF_NumRegistre",
         "TypeCorrespondance", "ScoreCorrespondance",
     ]
-
     columns = list(df.columns)
 
-    # En-têtes
-    for col_idx, col_name in enumerate(columns, start=1):
-        cell = ws.cell(row=1, column=col_idx, value=col_name)
-        cell.font      = header_font
+    for ci, cn in enumerate(columns, 1):
+        cell = ws.cell(row=1, column=ci, value=cn)
+        cell.font      = hfont
         cell.fill      = HEADER_FILL
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         cell.border    = border
 
-    # Données
-    for row_idx, row in enumerate(df.itertuples(index=False), start=2):
-        match_type = getattr(row, "TypeCorrespondance", "")
-        if match_type == "Exact – RCS":
-            row_fill = EXACT_FILL
-        elif match_type == "Approx – Nom/Pays":
-            row_fill = APPROX_FILL
-        elif match_type == "Non trouvé":
-            row_fill = MISS_FILL
-        else:
-            row_fill = None
+    for ri, row in enumerate(df.itertuples(index=False), 2):
+        mt = getattr(row, "TypeCorrespondance", "")
+        rf = EXACT_FILL if mt == "Exact – RCS" else \
+             APPROX_FILL if mt == "Approx – Nom/Pays" else \
+             MISS_FILL   if mt == "Non trouvé" else None
 
-        for col_idx, (col_name, value) in enumerate(zip(columns, row), start=1):
-            cell = ws.cell(row=row_idx, column=col_idx, value=value)
-            cell.font   = data_font
+        for ci, (cn, val) in enumerate(zip(columns, row), 1):
+            cell = ws.cell(row=ri, column=ci, value=val)
+            cell.font   = dfont
             cell.border = border
             cell.alignment = Alignment(vertical="center")
-
-            if col_name in gleif_cols and row_fill:
-                cell.fill = row_fill
-            elif col_name in gleif_cols:
+            if cn in gleif_cols and rf:
+                cell.fill = rf
+            elif cn in gleif_cols:
                 cell.fill = GLEIF_FILL
 
-    # Largeurs de colonnes auto
     col_widths = {
-        "LEI":                    25,
-        "GLEIF_NomLegal":         35,
-        "GLEIF_Pays":             10,
-        "GLEIF_StatutSociete":    16,
-        "GLEIF_StatutLEI":        14,
-        "GLEIF_AutoriteRegistre": 18,
-        "GLEIF_NumRegistre":      20,
-        "TypeCorrespondance":     20,
-        "ScoreCorrespondance":    12,
+        "LEI": 25, "GLEIF_NomLegal": 35, "GLEIF_Pays": 10,
+        "GLEIF_StatutSociete": 16, "GLEIF_StatutLEI": 14,
+        "GLEIF_AutoriteRegistre": 18, "GLEIF_NumRegistre": 20,
+        "TypeCorrespondance": 20, "ScoreCorrespondance": 12,
     }
-    for col_idx, col_name in enumerate(columns, start=1):
-        col_letter = get_column_letter(col_idx)
-        ws.column_dimensions[col_letter].width = col_widths.get(col_name, 22)
+    for ci, cn in enumerate(columns, 1):
+        ws.column_dimensions[get_column_letter(ci)].width = col_widths.get(cn, 22)
 
     ws.row_dimensions[1].height = 30
     ws.freeze_panes = "A2"
 
-    # Onglet légende
     ws_legend = wb.create_sheet("Légende")
-    legend_data = [
+    for r, (a, b) in enumerate([
         ("Couleur", "Signification"),
         ("Vert",    "Correspondance exacte par numéro RCS"),
-        ("Jaune",   f"Correspondance approximative par nom/pays (score ≥ {threshold})"),
+        (f"Jaune",  f"Correspondance approximative nom/pays (score ≥ {threshold})"),
         ("Rouge",   "Aucune correspondance trouvée"),
         ("Bleu",    "Colonnes issues de la base GLEIF"),
-    ]
-    for r, (col_a, col_b) in enumerate(legend_data, start=1):
-        ws_legend.cell(row=r, column=1, value=col_a).font = Font(bold=(r == 1))
-        ws_legend.cell(row=r, column=2, value=col_b).font = Font(bold=(r == 1))
+    ], 1):
+        ws_legend.cell(r, 1, a).font = Font(bold=(r == 1))
+        ws_legend.cell(r, 2, b).font = Font(bold=(r == 1))
     ws_legend.column_dimensions["A"].width = 15
     ws_legend.column_dimensions["B"].width = 55
 
     wb.save(output_path)
-    log.info("  Fichier Excel sauvegardé avec mise en forme.")
 
 
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # CLI
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Rapprochement LEI GLEIF à partir d'un fichier Excel"
-    )
-    parser.add_argument("--input",   required=True, help="Fichier Excel d'entrée (.xlsx)")
-    parser.add_argument("--gleif",   required=True, help="Fichier GLEIF Golden Copy (CSV ou JSON)")
-    parser.add_argument("--output",  required=True, help="Fichier Excel de sortie (.xlsx)")
-    parser.add_argument("--col-rcs",  default="RCS",            help="Nom de la colonne RCS  (défaut: RCS)")
-    parser.add_argument("--col-name", default="NomEntreprise",  help="Nom de la colonne nom  (défaut: NomEntreprise)")
-    parser.add_argument("--col-pays", default="Pays",           help="Nom de la colonne pays (défaut: Pays)")
-    parser.add_argument("--fuzzy-threshold", type=int, default=80,
-                        help="Seuil de similarité pour le fuzzy matching (0-100, défaut: 80)")
-    parser.add_argument("--active-only", action="store_true", default=True,
-                        help="Ne traiter que les entités GLEIF actives (défaut: oui)")
-    parser.add_argument("--all-statuses", dest="active_only", action="store_false",
-                        help="Inclure aussi les entités non-actives")
-    return parser.parse_args()
+def _parse_args():
+    p = argparse.ArgumentParser(description="GLEIF LEI Matcher")
+    p.add_argument("--input",             required=True)
+    p.add_argument("--gleif",             required=True)
+    p.add_argument("--output",            required=True)
+    p.add_argument("--col-rcs",           default="RCS")
+    p.add_argument("--col-name",          default="NomEntreprise")
+    p.add_argument("--col-pays",          default="Pays")
+    p.add_argument("--fuzzy-threshold",   type=int, default=80)
+    p.add_argument("--active-only",       action="store_true", default=True)
+    p.add_argument("--all-statuses",      dest="active_only", action="store_false")
+    p.add_argument("--prepare-slim",      action="store_true",
+                   help="Préparer une base slim avant le matching")
+    p.add_argument("--slim-output",       default=None,
+                   help="Chemin du CSV slim (défaut : gleif_slim.csv à côté du fichier GLEIF)")
+    return p.parse_args()
 
 
 if __name__ == "__main__":
-    args = parse_args()
+    args = _parse_args()
+
+    gleif_path = args.gleif
+    if args.prepare_slim:
+        slim_path = args.slim_output or str(Path(args.gleif).parent / "gleif_slim.csv")
+        log.info(f"Préparation de la base slim → {slim_path}")
+        prepare_slim(args.gleif, slim_path, active_only=args.active_only)
+        gleif_path = slim_path
+
     match_companies(
         input_path      = args.input,
-        gleif_path      = args.gleif,
+        gleif_path      = gleif_path,
         output_path     = args.output,
         col_rcs         = args.col_rcs,
         col_name        = args.col_name,
