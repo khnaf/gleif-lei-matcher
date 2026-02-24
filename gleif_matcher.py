@@ -201,8 +201,12 @@ def normalize_rcs(value) -> str:
       2. Conversion des chiffres Unicode non-ASCII restants
       3. Suppression du préfixe "RCS Ville" (ex : "RCS Paris 552 032 534")
       4. Suppression de tout caractère non alphanumérique
-      5. Suppression des zéros de tête (ex : "01513210151" → "1513210151")
-         Gère la divergence fréquente GLEIF/base client sur les zéros initiaux.
+
+    Note : les zéros de tête sont intentionnellement conservés.
+    Un RCS "1513210151" (base client) vs "01513210151" (GLEIF) n'est pas
+    normalisé à l'identique — cette différence est détectée par search_by_rcs_fuzzy
+    et signalée comme "Approx – RCS" pour que le Middle Office puisse corriger
+    son référentiel source.
     """
     if pd.isna(value) or str(value).strip() == "":
         return ""
@@ -217,12 +221,7 @@ def normalize_rcs(value) -> str:
     # Étape 3 : suppression du préfixe "RCS Ville"
     raw = re.sub(r"^RCS\s+[A-ZÉÈÀÂÊÎÔÙÛÇ\s]+\s+", "", raw).strip()
     # Étape 4 : garder uniquement les caractères alphanumériques ASCII
-    result = re.sub(r"[^0-9A-Z]", "", raw)
-    # Étape 5 : suppression des zéros de tête
-    # "01513210151" → "1513210151"  /  "00123" → "123"
-    # Si tout est zéros, on conserve le résultat original (ex: "0" ou "000")
-    stripped = result.lstrip("0")
-    return stripped if stripped else result
+    return re.sub(r"[^0-9A-Z]", "", raw)
 
 
 def normalize_name(value) -> str:
