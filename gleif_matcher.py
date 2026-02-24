@@ -32,6 +32,7 @@ Colonnes GLEIF gérées automatiquement (variantes selon version Golden Copy) :
 """
 
 import argparse
+import datetime
 import logging
 import re
 import sys
@@ -247,6 +248,34 @@ def country_to_iso(value) -> str:
         if unicodedata.category(c) != "Mn"
     )
     return COUNTRY_MAP.get(key_no_accent, COUNTRY_MAP.get(key, ""))
+
+
+def normalize_date(value) -> Optional[datetime.date]:
+    """
+    Normalise une date vers datetime.date quelle que soit sa représentation.
+
+    Formats gérés :
+      • GLEIF ISO 8601 : "2025-12-31T00:00:00Z" / "2025-12-31T00:00:00+00:00"
+      • Date ISO courte : "2025-12-31"
+      • Format client    : "31-12-2025" / "31/12/2025" / "31.12.2025"
+
+    Retourne None si la valeur est vide, nulle ou non parsable.
+    """
+    if pd.isna(value) or str(value).strip() in ("", "nan", "NaT", "None"):
+        return None
+    raw = str(value).strip()
+    # Tronquer au format yyyy-mm-dd si la date contient une partie heure
+    if "T" in raw:
+        raw = raw.split("T")[0]
+    elif len(raw) > 10 and raw[10] in (" ", "+"):
+        raw = raw[:10]
+    # Essai des formats courants (ISO d'abord, puis formats client)
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%d.%m.%Y", "%Y/%m/%d"):
+        try:
+            return datetime.datetime.strptime(raw, fmt).date()
+        except ValueError:
+            continue
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -670,8 +699,84 @@ def search_by_name_country(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Vérification de discordance pour un LEI existant
+# Contrôle qualité : écarts entre référentiel client et GLEIF
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _check_data_gaps(
+    gleif_row: pd.Series,
+    client_rcs_raw: str = "",
+    client_name_raw: str = "",
+    client_iso: str = "",
+    client_lei: str = "",
+    client_date_raw: str = "",
+    name_threshold: int = 70,
+) -> str:
+    """
+    Détecte et décrit tous les écarts entre le référentiel client et GLEIF.
+
+    Contrôles effectués pour tous les types de correspondance :
+      1. LEI    — manquant côté client  OU  différent de GLEIF
+      2. RCS    — manquant côté client  OU  différent (après normalisation)
+      3. Nom    — similarité < name_threshold (seulement si les deux ont une valeur)
+      4. Date   — manquante côté client OU  différente de GLEIF (après normalisation)
+
+    Retourne une chaîne décrivant tous les écarts, vide si aucun.
+    Utilisée pour alimenter la colonne LEI_Discordance dans tous les cas
+    (LEI Valide, Exact RCS, Approx RCS, Approx Nom/Pays, LEI Discordant…).
+    """
+    issues: List[str] = []
+
+    # ── 1. LEI ───────────────────────────────────────────────────────────────
+    lei_client = str(client_lei).strip().upper() if client_lei else ""
+    lei_gleif_raw = str(gleif_row.get("lei", "")).strip()
+    lei_gleif = lei_gleif_raw.upper()
+    if not lei_client and lei_gleif:
+        issues.append(f"LEI manquant → GLEIF: '{lei_gleif_raw}'")
+    elif lei_client and lei_gleif and lei_client != lei_gleif:
+        issues.append(
+            f"LEI: client='{client_lei.strip()}' ≠ GLEIF='{lei_gleif_raw}'"
+        )
+
+    # ── 2. RCS ───────────────────────────────────────────────────────────────
+    rcs_client_clean = str(client_rcs_raw).strip() if client_rcs_raw else ""
+    rcs_gleif_raw    = str(gleif_row.get("ra_entity", "")).strip()
+    rcs_norm_c = normalize_rcs(rcs_client_clean) if rcs_client_clean else ""
+    rcs_norm_g = normalize_rcs(rcs_gleif_raw)    if rcs_gleif_raw    else ""
+    if not rcs_norm_c and rcs_norm_g:
+        issues.append(f"RCS manquant → GLEIF: '{rcs_gleif_raw}'")
+    elif rcs_norm_c and rcs_norm_g and rcs_norm_c != rcs_norm_g:
+        issues.append(f"RCS: client='{rcs_client_clean}' ≠ GLEIF='{rcs_gleif_raw}'")
+
+    # ── 3. Nom légal ─────────────────────────────────────────────────────────
+    name_client_clean = str(client_name_raw).strip() if client_name_raw else ""
+    name_gleif_clean  = str(gleif_row.get("name", "")).strip()
+    if name_client_clean and name_gleif_clean:
+        n_c = normalize_name(name_client_clean)
+        n_g = normalize_name(name_gleif_clean)
+        if n_c and n_g:
+            score = fuzz.token_sort_ratio(n_c, n_g)
+            if score < name_threshold:
+                issues.append(
+                    f"Nom: client='{name_client_clean}' ≠ GLEIF='{name_gleif_clean}' "
+                    f"(sim={score}%)"
+                )
+
+    # ── 4. Date de validité LEI ───────────────────────────────────────────────
+    date_gleif_raw = str(gleif_row.get("renewal_date", "")).strip()
+    date_gleif     = normalize_date(date_gleif_raw)
+    date_client    = normalize_date(client_date_raw) if client_date_raw else None
+    if not date_client and date_gleif:
+        issues.append(
+            f"Date LEI manquante → GLEIF: '{date_gleif.strftime('%d-%m-%Y')}'"
+        )
+    elif date_client and date_gleif and date_client != date_gleif:
+        issues.append(
+            f"Date LEI: client='{date_client.strftime('%d-%m-%Y')}' "
+            f"≠ GLEIF='{date_gleif.strftime('%d-%m-%Y')}'"
+        )
+
+    return " | ".join(issues)
+
 
 def _check_lei_discordance(
     gleif_row: pd.Series,
@@ -751,8 +856,9 @@ def match_companies(
     col_name: str = "NomEntreprise",
     col_pays: str = "Pays",
     col_lei: Optional[str] = None,          # colonne LEI existant (v1.2)
+    col_date: Optional[str] = None,         # colonne date validité LEI (v1.4)
     fuzzy_threshold: int = 80,
-    rcs_fuzzy_threshold: int = 88,          # ← NOUVEAU v1.3 : seuil RCS approché
+    rcs_fuzzy_threshold: int = 88,
     active_only: bool = True,
     progress_cb: Optional[Callable[[int, int], None]] = None,
     status_cb: Optional[Callable[[str], None]] = None,
@@ -762,13 +868,18 @@ def match_companies(
 
     Paramètres
     ----------
-    col_lei : nom de la colonne contenant les LEI existants (optionnel).
-              Si présente et non vide pour une ligne → mode validation LEI.
-              Si absente ou vide → mode recherche (RCS puis fuzzy nom/pays).
+    col_lei  : colonne LEI existants (optionnel). Si présente et non vide → mode validation.
+    col_date : colonne date validité LEI côté client (optionnel, format dd-mm-yyyy).
+               Comparée avec GLEIF renewal_date ; écart signalé dans LEI_Discordance.
 
     Note : quand col_lei est fourni, le chargement GLEIF ignore le filtre
     active_only afin de retrouver même les LEI expirés (LAPSED / INACTIVE).
     Le statut réel est reporté dans GLEIF_StatutSociete et GLEIF_StatutLEI.
+
+    La colonne LEI_Discordance signale tous les écarts DQ pour chaque ligne
+    ayant une correspondance (LEI manquant, RCS manquant/différent, nom
+    différent, date manquante/différente) — applicable à tous les types
+    de correspondance, pas uniquement au mode validation LEI.
     """
     def _status(msg):
         log.info(msg)
@@ -813,11 +924,16 @@ def match_companies(
 
     _status("Rapprochement en cours …")
 
+    has_date_col = bool(col_date) and col_date in df_input.columns
+    if has_date_col:
+        _status(f"  Colonne date LEI détectée : '{col_date}' — contrôle de la date activé.")
+
     for idx, row in df_input.iterrows():
-        rcs_raw   = str(row[col_rcs]).strip()  if col_rcs  in df_input.columns else ""
-        name_raw  = str(row[col_name]).strip() if col_name in df_input.columns else ""
-        pays_raw  = str(row[col_pays]).strip() if col_pays in df_input.columns else ""
-        lei_exist = str(row[col_lei]).strip()  if has_lei_col else ""
+        rcs_raw   = str(row[col_rcs]).strip()   if col_rcs  in df_input.columns else ""
+        name_raw  = str(row[col_name]).strip()  if col_name in df_input.columns else ""
+        pays_raw  = str(row[col_pays]).strip()  if col_pays in df_input.columns else ""
+        lei_exist = str(row[col_lei]).strip()   if has_lei_col  else ""
+        date_raw  = str(row[col_date]).strip()  if has_date_col else ""
 
         rcs_norm  = normalize_rcs(rcs_raw)
         name_norm = normalize_name(name_raw)
@@ -833,16 +949,20 @@ def match_companies(
             gleif_row = search_by_lei(lei_exist, lei_index, df_gleif)
 
             if gleif_row is not None:
-                # LEI trouvé directement → vérifier la cohérence des données
-                disc_text, is_disc = _check_lei_discordance(
-                    gleif_row, rcs_raw, name_raw, iso, client_lei=lei_exist
-                )
-                if is_disc:
+                # LEI trouvé directement : match_type basé sur comparaison LEI
+                lei_g = str(gleif_row.get("lei", "")).strip().upper()
+                lei_c = str(lei_exist).strip().upper()
+                if lei_c and lei_g and lei_c != lei_g:
                     match_type = "LEI Discordant"
                     n_discordant += 1
                 else:
                     match_type = "LEI Valide"
                     n_valid += 1
+                # Tous les écarts DQ pour cette ligne (LEI + RCS + Nom + Date)
+                disc_text = _check_data_gaps(
+                    gleif_row, rcs_raw, name_raw, iso,
+                    client_lei=lei_exist, client_date_raw=date_raw
+                )
 
             else:
                 # LEI introuvable dans GLEIF → fallback par RCS/nom pour
@@ -851,7 +971,6 @@ def match_companies(
 
                 if rcs_norm:
                     fallback_row = search_by_rcs(rcs_norm, rcs_index, df_gleif)
-                    # Fallback RCS approché si exact échoue (même logique que Mode 2)
                     if fallback_row is None and rcs_fuzzy_threshold > 0:
                         fallback_row, _fb_rcs_score = search_by_rcs_fuzzy(
                             rcs_norm, rcs_index, df_gleif, rcs_fuzzy_threshold
@@ -863,22 +982,15 @@ def match_companies(
                     )
 
                 if fallback_row is not None:
-                    # Entité retrouvée par RCS/nom : le LEI du client est incorrect
-                    disc_text, _ = _check_lei_discordance(
-                        fallback_row, rcs_raw, name_raw, iso, client_lei=lei_exist
-                    )
-                    # La comparaison LEI est toujours présente (client ≠ GLEIF)
-                    # Si pas d'autres écarts, forcer au moins la mention du LEI
-                    if not disc_text:
-                        gleif_lei = str(fallback_row.get("lei", "")).strip()
-                        disc_text = (
-                            f"LEI: client='{lei_exist}' ≠ GLEIF='{gleif_lei}'"
-                        )
+                    gleif_row  = fallback_row
                     match_type = "LEI Discordant"
                     n_discordant += 1
-                    gleif_row = fallback_row  # on utilise la ligne retrouvée
+                    # Tous les écarts DQ (_check_data_gaps inclut la comparaison LEI)
+                    disc_text = _check_data_gaps(
+                        gleif_row, rcs_raw, name_raw, iso,
+                        client_lei=lei_exist, client_date_raw=date_raw
+                    )
                 else:
-                    # Introuvable par aucun moyen
                     match_type = "Non trouvé (LEI invalide)"
                     n_lei_unknown += 1
 
@@ -948,6 +1060,12 @@ def match_companies(
 
             if gleif_row is None:
                 n_miss += 1
+            else:
+                # Écarts DQ pour tous les types de correspondance Mode 2
+                disc_text = _check_data_gaps(
+                    gleif_row, rcs_raw, name_raw, iso,
+                    client_lei=lei_exist, client_date_raw=date_raw
+                )
 
         # ── Construction de la ligne de résultat ─────────────────────────────
         if gleif_row is not None:
@@ -1133,6 +1251,8 @@ def _parse_args():
     p.add_argument("--col-pays",          default="Pays")
     p.add_argument("--col-lei",           default=None,
                    help="Colonne LEI existant dans le fichier d'entrée (ex: LEI_Existant)")
+    p.add_argument("--col-date",          default=None,
+                   help="Colonne date validité LEI côté client (format dd-mm-yyyy, ex: LEI_DateValidite)")
     p.add_argument("--fuzzy-threshold",     type=int, default=80,
                    help="Seuil similarité nom/pays (défaut: 80)")
     p.add_argument("--rcs-fuzzy-threshold", type=int, default=88,
@@ -1164,6 +1284,7 @@ if __name__ == "__main__":
         col_name            = args.col_name,
         col_pays            = args.col_pays,
         col_lei             = args.col_lei,
+        col_date            = args.col_date,
         fuzzy_threshold     = args.fuzzy_threshold,
         rcs_fuzzy_threshold = args.rcs_fuzzy_threshold,
         active_only         = args.active_only,

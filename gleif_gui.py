@@ -121,6 +121,7 @@ class GleifApp(tk.Tk):
         self.v_col_name   = tk.StringVar(value=cfg.get("col_name", "NomEntreprise"))
         self.v_col_pays   = tk.StringVar(value=cfg.get("col_pays", "Pays"))
         self.v_col_lei    = tk.StringVar(value=cfg.get("col_lei",  "LEI_Existant"))
+        self.v_col_date   = tk.StringVar(value=cfg.get("col_date", "LEI_DateValidite"))
         self.v_threshold      = tk.IntVar(value=int(cfg.get("fuzzy_threshold", 80)))
         self.v_rcs_threshold  = tk.IntVar(value=int(cfg.get("rcs_fuzzy_threshold", 88)))
         self.v_active         = tk.BooleanVar(value=bool(cfg.get("active_only", True)))
@@ -243,6 +244,24 @@ class GleifApp(tk.Tk):
         tk.Label(
             lei_col_row,
             text="(optionnel — laisser vide si pas de LEI en base)",
+            font=("Segoe UI", 8, "italic"), fg=C_SUBTLE, bg=C_BG,
+        ).pack(side="left")
+
+        # Colonne date validité LEI (optionnelle)
+        date_col_row = tk.Frame(cols_frame, bg=C_BG)
+        date_col_row.pack(fill="x", pady=2)
+        tk.Label(
+            date_col_row,
+            text="Colonne Date LEI existant",
+            font=("Segoe UI", 10), fg=C_TEXT, bg=C_BG, width=26, anchor="w",
+        ).pack(side="left")
+        ttk.Entry(
+            date_col_row, textvariable=self.v_col_date, width=28,
+            font=("Segoe UI", 10),
+        ).pack(side="left", padx=(4, 4))
+        tk.Label(
+            date_col_row,
+            text="(optionnel — format dd-mm-yyyy dans votre base)",
             font=("Segoe UI", 8, "italic"), fg=C_SUBTLE, bg=C_BG,
         ).pack(side="left")
 
@@ -463,7 +482,7 @@ class GleifApp(tk.Tk):
             from gleif_matcher import (
                 load_gleif, build_indices,
                 search_by_rcs, search_by_rcs_fuzzy, search_by_name_country, search_by_lei,
-                _check_lei_discordance, normalize_rcs, normalize_name,
+                _check_data_gaps, normalize_rcs, normalize_name,
                 country_to_iso, _export_excel, _safe_read_excel,
             )
             from rapidfuzz import fuzz as _fuzz
@@ -485,6 +504,7 @@ class GleifApp(tk.Tk):
             col_name = self.v_col_name.get().strip()
             col_pays = self.v_col_pays.get().strip()
             col_lei  = self.v_col_lei.get().strip() or None
+            col_date = self.v_col_date.get().strip() or None
 
             # Vérification colonnes obligatoires
             missing = [c for c in [col_rcs, col_name, col_pays] if c not in df_input.columns]
@@ -495,9 +515,10 @@ class GleifApp(tk.Tk):
                 )
                 return
 
-            # Détermination du mode LEI
-            has_lei_col = bool(col_lei) and col_lei in df_input.columns
-            active_only = bool(self.v_active.get())
+            # Détermination du mode LEI / date
+            has_lei_col  = bool(col_lei)  and col_lei  in df_input.columns
+            has_date_col = bool(col_date) and col_date in df_input.columns
+            active_only  = bool(self.v_active.get())
             # En mode validation, charger tous les statuts pour trouver les LEI expirés
             _active_only_load = active_only if not has_lei_col else False
 
@@ -518,10 +539,11 @@ class GleifApp(tk.Tk):
             n_valid = n_discordant = n_lei_unknown = 0
 
             for idx, row in df_input.iterrows():
-                rcs_raw   = str(row[col_rcs]).strip()  if col_rcs  in df_input.columns else ""
-                name_raw  = str(row[col_name]).strip() if col_name in df_input.columns else ""
-                pays_raw  = str(row[col_pays]).strip() if col_pays in df_input.columns else ""
-                lei_exist = str(row[col_lei]).strip()  if has_lei_col else ""
+                rcs_raw   = str(row[col_rcs]).strip()   if col_rcs  in df_input.columns else ""
+                name_raw  = str(row[col_name]).strip()  if col_name in df_input.columns else ""
+                pays_raw  = str(row[col_pays]).strip()  if col_pays in df_input.columns else ""
+                lei_exist = str(row[col_lei]).strip()   if has_lei_col  else ""
+                date_raw  = str(row[col_date]).strip()  if has_date_col else ""
 
                 rcs_norm  = normalize_rcs(rcs_raw)
                 name_norm = normalize_name(name_raw)
@@ -537,23 +559,24 @@ class GleifApp(tk.Tk):
                     gleif_row = search_by_lei(lei_exist, lei_index, df_gleif)
 
                     if gleif_row is not None:
-                        # LEI trouvé directement → vérifier cohérence des données
-                        disc_text, is_disc = _check_lei_discordance(
-                            gleif_row, rcs_raw, name_raw, iso, client_lei=lei_exist
-                        )
-                        if is_disc:
+                        # match_type basé sur comparaison LEI uniquement
+                        lei_g = str(gleif_row.get("lei", "")).strip().upper()
+                        lei_c = str(lei_exist).strip().upper()
+                        if lei_c and lei_g and lei_c != lei_g:
                             match_type = "LEI Discordant"
                             n_discordant += 1
                         else:
                             match_type = "LEI Valide"
                             n_valid += 1
+                        # Tous les écarts DQ (LEI + RCS + Nom + Date)
+                        disc_text = _check_data_gaps(
+                            gleif_row, rcs_raw, name_raw, iso,
+                            client_lei=lei_exist, client_date_raw=date_raw)
                     else:
-                        # LEI introuvable → fallback RCS/nom pour retrouver l'entité
-                        # et comparer le bon LEI avec celui du client
+                        # LEI introuvable → fallback RCS/nom
                         fallback_row = None
                         if rcs_norm:
                             fallback_row = search_by_rcs(rcs_norm, rcs_index, df_gleif)
-                            # Fallback RCS approché si exact échoue (même logique que Mode 2)
                             if fallback_row is None and rcs_threshold < 100:
                                 fallback_row, _fb_rcs_sc = search_by_rcs_fuzzy(
                                     rcs_norm, rcs_index, df_gleif, rcs_threshold)
@@ -562,15 +585,12 @@ class GleifApp(tk.Tk):
                                 name_norm, iso, name_index, df_gleif, threshold)
 
                         if fallback_row is not None:
-                            disc_text, _ = _check_lei_discordance(
-                                fallback_row, rcs_raw, name_raw, iso, client_lei=lei_exist
-                            )
-                            if not disc_text:
-                                g_lei = str(fallback_row.get("lei", "")).strip()
-                                disc_text = f"LEI: client='{lei_exist}' ≠ GLEIF='{g_lei}'"
+                            gleif_row  = fallback_row
                             match_type = "LEI Discordant"
                             n_discordant += 1
-                            gleif_row = fallback_row
+                            disc_text = _check_data_gaps(
+                                gleif_row, rcs_raw, name_raw, iso,
+                                client_lei=lei_exist, client_date_raw=date_raw)
                         else:
                             match_type = "Non trouvé (LEI invalide)"
                             n_lei_unknown += 1
@@ -628,6 +648,11 @@ class GleifApp(tk.Tk):
 
                     if gleif_row is None:
                         n_miss += 1
+                    else:
+                        # Écarts DQ pour tous les types de correspondance Mode 2
+                        disc_text = _check_data_gaps(
+                            gleif_row, rcs_raw, name_raw, iso,
+                            client_lei=lei_exist, client_date_raw=date_raw)
 
                 results.append({
                     "LEI_GLEIF":                gleif_row["lei"]            if gleif_row is not None else "",
@@ -732,6 +757,7 @@ class GleifApp(tk.Tk):
             "col_name":        self.v_col_name.get(),
             "col_pays":        self.v_col_pays.get(),
             "col_lei":         self.v_col_lei.get(),
+            "col_date":        self.v_col_date.get(),
             "fuzzy_threshold":     int(self.v_threshold.get()),
             "rcs_fuzzy_threshold": int(self.v_rcs_threshold.get()),
             "active_only":         bool(self.v_active.get()),
