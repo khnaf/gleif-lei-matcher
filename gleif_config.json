@@ -13,6 +13,9 @@
     "fuzzy_threshold": 80,
     "_fuzzy_threshold_info": "Seuil de similarité pour la correspondance par nom (0-100). 80 recommandé.",
 
+    "rcs_fuzzy_threshold": 88,
+    "_rcs_fuzzy_threshold_info": "Seuil pour la correspondance RCS approchée (0-100). 88 recommandé. Gère les zéros de tête, légères variantes de formatage. 100 = exact uniquement.",
+
     "active_only": true,
     "_active_only_info": "true = seulement les LEI actifs (Entity=ACTIVE et LEI=ISSUED) pour la recherche. Ignoré en mode validation LEI (tous statuts chargés)."
 }

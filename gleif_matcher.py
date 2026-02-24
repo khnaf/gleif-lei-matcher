@@ -193,11 +193,36 @@ def _detect_gleif_columns(available_cols: List[str]) -> Tuple[Dict[str, str], Li
 # ─────────────────────────────────────────────────────────────────────────────
 
 def normalize_rcs(value) -> str:
+    """
+    Normalise un numéro de registre pour la comparaison.
+
+    Étapes :
+      1. Unicode NFKC : chiffres pleine largeur (０-９), arabes-indics (٠-٩), etc.
+      2. Conversion des chiffres Unicode non-ASCII restants
+      3. Suppression du préfixe "RCS Ville" (ex : "RCS Paris 552 032 534")
+      4. Suppression de tout caractère non alphanumérique
+      5. Suppression des zéros de tête (ex : "01513210151" → "1513210151")
+         Gère la divergence fréquente GLEIF/base client sur les zéros initiaux.
+    """
     if pd.isna(value) or str(value).strip() == "":
         return ""
-    raw = str(value).upper()
+    raw = str(value)
+    # Étape 1 : normalisation Unicode NFKC
+    raw = unicodedata.normalize("NFKC", raw).upper()
+    # Étape 2 : chiffres Unicode non-ASCII restants → ASCII
+    raw = "".join(
+        str(unicodedata.digit(c, -1)) if unicodedata.category(c) == "Nd" and not c.isascii() else c
+        for c in raw
+    )
+    # Étape 3 : suppression du préfixe "RCS Ville"
     raw = re.sub(r"^RCS\s+[A-ZÉÈÀÂÊÎÔÙÛÇ\s]+\s+", "", raw).strip()
-    return re.sub(r"[^0-9A-Z]", "", raw)
+    # Étape 4 : garder uniquement les caractères alphanumériques ASCII
+    result = re.sub(r"[^0-9A-Z]", "", raw)
+    # Étape 5 : suppression des zéros de tête
+    # "01513210151" → "1513210151"  /  "00123" → "123"
+    # Si tout est zéros, on conserve le résultat original (ex: "0" ou "000")
+    stripped = result.lstrip("0")
+    return stripped if stripped else result
 
 
 def normalize_name(value) -> str:
@@ -526,6 +551,54 @@ def search_by_rcs(
     return df.iloc[indices[0]] if indices else None
 
 
+def search_by_rcs_fuzzy(
+    rcs_norm: str,
+    rcs_index: Dict[str, List[int]],
+    df: pd.DataFrame,
+    threshold: int = 88,
+) -> Tuple[Optional[pd.Series], int]:
+    """
+    Recherche approximative par numéro de registre.
+
+    Stratégie :
+      1. Filtre rapide : ne compare que les clés dont la longueur est dans
+         [len(rcs_norm)-2, len(rcs_norm)+2] pour limiter les faux positifs
+         et réduire le nombre de comparaisons.
+      2. Scorer fuzz.ratio (similitude Levenshtein) ≥ threshold.
+
+    Exemple :
+      "1513210151" ≈ "1513210151" (même valeur, Unicode différent → corrigé
+      par normalize_rcs avant d'arriver ici ; sinon distance ≥ 90 %).
+
+    Retourne :
+      (row, score)  si trouvé,  (None, 0)  sinon.
+    """
+    if not rcs_norm or len(rcs_norm) < 4:
+        return None, 0
+
+    n = len(rcs_norm)
+    # Pré-filtrage par longueur similaire (±2 caractères)
+    candidates = {
+        k: idxs
+        for k, idxs in rcs_index.items()
+        if abs(len(k) - n) <= 2
+    }
+    if not candidates:
+        return None, 0
+
+    result = process.extractOne(
+        rcs_norm,
+        list(candidates.keys()),
+        scorer=fuzz.ratio,
+        score_cutoff=threshold,
+    )
+    if result is None:
+        return None, 0
+
+    best_key, score, _ = result
+    return df.iloc[candidates[best_key][0]], int(score)
+
+
 def search_by_lei(
     lei_val: str,
     lei_index: Dict[str, int],
@@ -644,8 +717,9 @@ def match_companies(
     col_rcs: str = "RCS",
     col_name: str = "NomEntreprise",
     col_pays: str = "Pays",
-    col_lei: Optional[str] = None,          # ← NOUVEAU v1.2 : colonne LEI existant
+    col_lei: Optional[str] = None,          # colonne LEI existant (v1.2)
     fuzzy_threshold: int = 80,
+    rcs_fuzzy_threshold: int = 88,          # ← NOUVEAU v1.3 : seuil RCS approché
     active_only: bool = True,
     progress_cb: Optional[Callable[[int, int], None]] = None,
     status_cb: Optional[Callable[[str], None]] = None,
@@ -701,7 +775,7 @@ def match_companies(
 
     results = []
     n_total = len(df_input)
-    n_exact = n_approx = n_miss = 0
+    n_exact = n_approx_rcs = n_approx = n_miss = 0
     n_valid = n_discordant = n_lei_unknown = 0
 
     _status("Rapprochement en cours …")
@@ -772,11 +846,10 @@ def match_companies(
 
         # ── Mode 2 : recherche d'un LEI manquant ─────────────────────────────
         else:
-            # Recherche par RCS
+            # ── 2a. Correspondance RCS exacte ────────────────────────────────
             if rcs_norm:
                 gleif_row = search_by_rcs(rcs_norm, rcs_index, df_gleif)
                 if gleif_row is not None:
-                    # Vérification active_only (le DF peut contenir tous statuts)
                     if active_only:
                         es = str(gleif_row.get("entity_status", "")).upper()
                         ls = str(gleif_row.get("lei_status", "")).upper()
@@ -787,13 +860,43 @@ def match_companies(
                         match_score = 100
                         n_exact    += 1
 
-            # Fallback fuzzy nom/pays
+            # ── 2b. Correspondance RCS approchée ─────────────────────────────
+            # Intercalée entre exact RCS et fuzzy nom, elle gère les cas :
+            #   • zéro(s) de tête différents : "1513210151" vs "01513210151"
+            #     (résolu aussi par normalize_rcs, cette étape est le filet)
+            #   • faute de frappe mineure, formatage légèrement différent
+            if gleif_row is None and rcs_norm and rcs_fuzzy_threshold > 0:
+                approx_row, rcs_score = search_by_rcs_fuzzy(
+                    rcs_norm, rcs_index, df_gleif, rcs_fuzzy_threshold
+                )
+                if approx_row is not None:
+                    if active_only:
+                        es = str(approx_row.get("entity_status", "")).upper()
+                        ls = str(approx_row.get("lei_status", "")).upper()
+                        if es != "ACTIVE" or ls != "ISSUED":
+                            approx_row = None
+                    if approx_row is not None:
+                        # Validation secondaire : similarité nom pour s'assurer
+                        # qu'il ne s'agit pas d'une coïncidence de numéro
+                        gl_name_norm = normalize_name(str(approx_row.get("name", "")))
+                        name_sim = (
+                            fuzz.token_sort_ratio(name_norm, gl_name_norm)
+                            if name_norm and gl_name_norm else ""
+                        )
+                        match_score = (
+                            f"RCS:{rcs_score}% / Nom:{name_sim}%"
+                            if name_sim != "" else f"RCS:{rcs_score}%"
+                        )
+                        match_type = "Approx – RCS"
+                        gleif_row  = approx_row
+                        n_approx_rcs += 1
+
+            # ── 2c. Correspondance approximative nom + pays ───────────────────
             if gleif_row is None and name_norm:
                 gleif_row, score = search_by_name_country(
                     name_norm, iso, name_index, df_gleif, fuzzy_threshold
                 )
                 if gleif_row is not None:
-                    # Vérification active_only
                     if active_only:
                         es = str(gleif_row.get("entity_status", "")).upper()
                         ls = str(gleif_row.get("lei_status", "")).upper()
@@ -848,9 +951,10 @@ def match_companies(
         f"  Total             : {n_total:>6,}\n"
         f"  LEI Valide        : {n_valid:>6,}  ({n_valid/n_total*100:.1f}%)\n"
         f"  LEI Discordant    : {n_discordant:>6,}  ({n_discordant/n_total*100:.1f}%)\n"
-        f"  LEI Inconnu GLEIF : {n_lei_unknown:>6,}  ({n_lei_unknown/n_total*100:.1f}%)\n"
+        f"  LEI Invalide      : {n_lei_unknown:>6,}  ({n_lei_unknown/n_total*100:.1f}%)\n"
         f"  Exact RCS         : {n_exact:>6,}  ({n_exact/n_total*100:.1f}%)\n"
-        f"  Approx Nom        : {n_approx:>6,}  ({n_approx/n_total*100:.1f}%)\n"
+        f"  Approx RCS        : {n_approx_rcs:>6,}  ({n_approx_rcs/n_total*100:.1f}%)\n"
+        f"  Approx Nom/Pays   : {n_approx:>6,}  ({n_approx/n_total*100:.1f}%)\n"
         f"  Non trouvé        : {n_miss:>6,}  ({n_miss/n_total*100:.1f}%)\n"
         f"{'='*55}"
     )
@@ -872,10 +976,11 @@ def _export_excel(df: pd.DataFrame, output_path: str, threshold: int) -> None:
 
     HEADER_FILL   = PatternFill("solid", fgColor="1F4E79")
     GLEIF_FILL    = PatternFill("solid", fgColor="D6E4F0")
-    EXACT_FILL    = PatternFill("solid", fgColor="D9EAD3")   # vert  → Exact RCS / LEI Valide
+    EXACT_FILL    = PatternFill("solid", fgColor="D9EAD3")   # vert foncé → Exact RCS / LEI Valide
+    APPROX_RCS_FILL = PatternFill("solid", fgColor="EAF4E4") # vert clair → Approx RCS
     APPROX_FILL   = PatternFill("solid", fgColor="FFF2CC")   # jaune → Approx Nom/Pays
     DISCORD_FILL  = PatternFill("solid", fgColor="FCE8D0")   # orange → LEI Discordant
-    UNKNOWN_FILL  = PatternFill("solid", fgColor="DAE8FC")   # bleu clair → LEI Inconnu GLEIF
+    UNKNOWN_FILL  = PatternFill("solid", fgColor="DAE8FC")   # bleu clair → LEI Invalide
     MISS_FILL     = PatternFill("solid", fgColor="FCE4D6")   # rouge → Non trouvé
 
     thin   = Side(style="thin", color="AAAAAA")
@@ -904,11 +1009,13 @@ def _export_excel(df: pd.DataFrame, output_path: str, threshold: int) -> None:
         mt = getattr(row, "TypeCorrespondance", "")
         if mt in ("Exact – RCS", "LEI Valide"):
             rf = EXACT_FILL
+        elif mt == "Approx – RCS":
+            rf = APPROX_RCS_FILL
         elif mt == "Approx – Nom/Pays":
             rf = APPROX_FILL
         elif mt == "LEI Discordant":
             rf = DISCORD_FILL
-        elif mt == "LEI Inconnu – GLEIF":
+        elif mt in ("LEI Inconnu – GLEIF", "Non trouvé (LEI invalide)"):
             rf = UNKNOWN_FILL
         else:
             rf = MISS_FILL
@@ -947,7 +1054,8 @@ def _export_excel(df: pd.DataFrame, output_path: str, threshold: int) -> None:
         ("GLEIF_DateRenouvellement", "Date de prochaine échéance du LEI selon GLEIF"),
         ("", ""),
         ("Couleur",             "Signification du type de correspondance"),
-        ("Vert",                "LEI validé (données cohérentes) ou correspondance exacte par RCS"),
+        ("Vert foncé",          "LEI validé (données cohérentes) ou correspondance exacte par RCS"),
+        ("Vert clair",          "Correspondance RCS approchée — ScoreCorrespondance = 'RCS:xx% / Nom:yy%'"),
         ("Jaune",               f"Correspondance approximative nom/pays (score ≥ {threshold} %)"),
         ("Orange",              "LEI Discordant — divergence détectée (LEI erroné, RCS/nom/pays différent)"),
         ("Bleu clair",          "Non trouvé (LEI invalide) — introuvable même par RCS/nom"),
@@ -961,7 +1069,8 @@ def _export_excel(df: pd.DataFrame, output_path: str, threshold: int) -> None:
          "   Si trouvé : LEI Discordant (avec comparaison LEI_client vs LEI_GLEIF)\n"
          "   Si introuvable : Non trouvé (LEI invalide)"),
         ("3. Pas de LEI_Existant",
-         "→ recherche par RCS exact, puis approximation nom+pays"),
+         "→ RCS exact, puis RCS approché (zéros de tête, fautes légères),\n"
+         "   puis approximation nom+pays"),
     ]
     for r, (a, b) in enumerate(legend_rows, 1):
         ws_legend.cell(r, 1, a).font = Font(bold=(r == 1))
@@ -986,8 +1095,11 @@ def _parse_args():
     p.add_argument("--col-pays",          default="Pays")
     p.add_argument("--col-lei",           default=None,
                    help="Colonne LEI existant dans le fichier d'entrée (ex: LEI_Existant)")
-    p.add_argument("--fuzzy-threshold",   type=int, default=80)
-    p.add_argument("--active-only",       action="store_true", default=True)
+    p.add_argument("--fuzzy-threshold",     type=int, default=80,
+                   help="Seuil similarité nom/pays (défaut: 80)")
+    p.add_argument("--rcs-fuzzy-threshold", type=int, default=88,
+                   help="Seuil similarité RCS approché (défaut: 88, 0=désactivé)")
+    p.add_argument("--active-only",         action="store_true", default=True)
     p.add_argument("--all-statuses",      dest="active_only", action="store_false")
     p.add_argument("--prepare-slim",      action="store_true",
                    help="Préparer une base slim avant le matching")
@@ -1007,13 +1119,14 @@ if __name__ == "__main__":
         gleif_path = slim_path
 
     match_companies(
-        input_path      = args.input,
-        gleif_path      = gleif_path,
-        output_path     = args.output,
-        col_rcs         = args.col_rcs,
-        col_name        = args.col_name,
-        col_pays        = args.col_pays,
-        col_lei         = args.col_lei,
-        fuzzy_threshold = args.fuzzy_threshold,
-        active_only     = args.active_only,
+        input_path          = args.input,
+        gleif_path          = gleif_path,
+        output_path         = args.output,
+        col_rcs             = args.col_rcs,
+        col_name            = args.col_name,
+        col_pays            = args.col_pays,
+        col_lei             = args.col_lei,
+        fuzzy_threshold     = args.fuzzy_threshold,
+        rcs_fuzzy_threshold = args.rcs_fuzzy_threshold,
+        active_only         = args.active_only,
     )

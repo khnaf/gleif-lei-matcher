@@ -121,8 +121,9 @@ class GleifApp(tk.Tk):
         self.v_col_name   = tk.StringVar(value=cfg.get("col_name", "NomEntreprise"))
         self.v_col_pays   = tk.StringVar(value=cfg.get("col_pays", "Pays"))
         self.v_col_lei    = tk.StringVar(value=cfg.get("col_lei",  "LEI_Existant"))
-        self.v_threshold  = tk.IntVar(value=int(cfg.get("fuzzy_threshold", 80)))
-        self.v_active     = tk.BooleanVar(value=bool(cfg.get("active_only", True)))
+        self.v_threshold      = tk.IntVar(value=int(cfg.get("fuzzy_threshold", 80)))
+        self.v_rcs_threshold  = tk.IntVar(value=int(cfg.get("rcs_fuzzy_threshold", 88)))
+        self.v_active         = tk.BooleanVar(value=bool(cfg.get("active_only", True)))
         self.v_use_slim   = tk.BooleanVar(value=bool(cfg.get("use_slim", False)))
         self.v_progress   = tk.DoubleVar(value=0)
         self.v_status_msg = tk.StringVar(value="En attente…")
@@ -265,9 +266,32 @@ class GleifApp(tk.Tk):
         opt_frame = tk.Frame(body, bg=C_BG)
         opt_frame.pack(fill="x")
 
+        # Seuil RCS approché
+        rcs_thr_row = tk.Frame(opt_frame, bg=C_BG)
+        rcs_thr_row.pack(fill="x", pady=4)
+        tk.Label(rcs_thr_row, text="Seuil RCS approché",
+                 font=("Segoe UI", 10), fg=C_TEXT, bg=C_BG, width=26, anchor="w").pack(side="left")
+        self._lbl_rcs_threshold = tk.Label(
+            rcs_thr_row, text=f"{self.v_rcs_threshold.get()} %",
+            font=("Segoe UI", 10, "bold"), fg=C_ACCENT2, bg=C_BG, width=6)
+        self._lbl_rcs_threshold.pack(side="right")
+        ttk.Scale(rcs_thr_row, from_=70, to=100, orient="horizontal",
+                  variable=self.v_rcs_threshold, length=280,
+                  command=lambda v: self._lbl_rcs_threshold.config(text=f"{int(float(v))} %")
+                  ).pack(side="left", padx=(4, 0))
+
+        rcs_hint = tk.Frame(opt_frame, bg=C_BG)
+        rcs_hint.pack(fill="x", pady=(0, 4))
+        tk.Label(rcs_hint, text="",
+                 bg=C_BG, width=26).pack(side="left")
+        tk.Label(rcs_hint,
+                 text="Ex: '1513210151' ≈ '01513210151' (zéro de tête) → détecté à 95%+    |    100% = exact uniquement",
+                 font=("Segoe UI", 8, "italic"), fg=C_SUBTLE, bg=C_BG).pack(side="left")
+
+        # Seuil similarité nom/pays
         thr_row = tk.Frame(opt_frame, bg=C_BG)
         thr_row.pack(fill="x", pady=4)
-        tk.Label(thr_row, text="Seuil de similarité (fuzzy)",
+        tk.Label(thr_row, text="Seuil similarité nom/pays",
                  font=("Segoe UI", 10), fg=C_TEXT, bg=C_BG, width=26, anchor="w").pack(side="left")
         self._lbl_threshold = tk.Label(
             thr_row, text=f"{self.v_threshold.get()} %",
@@ -409,10 +433,11 @@ class GleifApp(tk.Tk):
             import pandas as pd
             from gleif_matcher import (
                 load_gleif, build_indices,
-                search_by_rcs, search_by_name_country, search_by_lei,
+                search_by_rcs, search_by_rcs_fuzzy, search_by_name_country, search_by_lei,
                 _check_lei_discordance, normalize_rcs, normalize_name,
                 country_to_iso, _export_excel, _safe_read_excel,
             )
+            from rapidfuzz import fuzz as _fuzz
 
             self._set_status("Lecture du fichier societes...")
             try:
@@ -457,9 +482,10 @@ class GleifApp(tk.Tk):
             self._set_status("Construction des index...")
             rcs_index, name_index, lei_index = build_indices(df_gleif)
 
-            threshold = int(self.v_threshold.get())
+            threshold     = int(self.v_threshold.get())
+            rcs_threshold = int(self.v_rcs_threshold.get())
             results = []
-            n_exact = n_approx = n_miss = 0
+            n_exact = n_approx_rcs = n_approx = n_miss = 0
             n_valid = n_discordant = n_lei_unknown = 0
 
             for idx, row in df_input.iterrows():
@@ -518,6 +544,7 @@ class GleifApp(tk.Tk):
 
                 # ── Mode 2 : recherche d'un LEI manquant ─────────────────────
                 else:
+                    # 2a. RCS exact
                     if rcs_norm:
                         gleif_row = search_by_rcs(rcs_norm, rcs_index, df_gleif)
                         if gleif_row is not None:
@@ -531,6 +558,26 @@ class GleifApp(tk.Tk):
                                 match_score = 100
                                 n_exact    += 1
 
+                    # 2b. RCS approché (zéros de tête, fautes légères)
+                    if gleif_row is None and rcs_norm and rcs_threshold < 100:
+                        approx_r, rcs_sc = search_by_rcs_fuzzy(
+                            rcs_norm, rcs_index, df_gleif, rcs_threshold)
+                        if approx_r is not None:
+                            if active_only:
+                                es = str(approx_r.get("entity_status", "")).upper()
+                                ls = str(approx_r.get("lei_status", "")).upper()
+                                if es != "ACTIVE" or ls != "ISSUED":
+                                    approx_r = None
+                            if approx_r is not None:
+                                gl_nm = normalize_name(str(approx_r.get("name", "")))
+                                nm_sc = _fuzz.token_sort_ratio(name_norm, gl_nm) if name_norm and gl_nm else ""
+                                match_score = (f"RCS:{rcs_sc}% / Nom:{nm_sc}%"
+                                               if nm_sc != "" else f"RCS:{rcs_sc}%")
+                                match_type  = "Approx – RCS"
+                                gleif_row   = approx_r
+                                n_approx_rcs += 1
+
+                    # 2c. Fuzzy nom + pays
                     if gleif_row is None and name_norm:
                         gleif_row, score = search_by_name_country(
                             name_norm, iso, name_index, df_gleif, threshold)
@@ -564,7 +611,7 @@ class GleifApp(tk.Tk):
                 })
 
                 if (idx + 1) % 10 == 0 or (idx + 1) == n_total:
-                    n_ok  = n_exact + n_approx + n_valid
+                    n_ok  = n_exact + n_approx_rcs + n_approx + n_valid
                     n_ko  = n_discordant + n_lei_unknown + n_miss
                     pct   = (idx + 1) / n_total * 100
                     self._update_progress(
@@ -578,7 +625,7 @@ class GleifApp(tk.Tk):
             df_output  = pd.concat([df_input.reset_index(drop=True), df_results], axis=1)
             _export_excel(df_output, self.v_output.get(), threshold)
             self.after(0, lambda: self._show_summary(
-                n_total, n_exact, n_approx, n_miss,
+                n_total, n_exact, n_approx_rcs, n_approx, n_miss,
                 n_valid, n_discordant, n_lei_unknown
             ))
 
@@ -601,7 +648,7 @@ class GleifApp(tk.Tk):
             self.v_status_msg.set("Erreur — voir le message ci-dessus.")
         self.after(0, _s)
 
-    def _show_summary(self, n_total, n_exact, n_approx, n_miss,
+    def _show_summary(self, n_total, n_exact, n_approx_rcs=0, n_approx=0, n_miss=0,
                       n_valid=0, n_discordant=0, n_lei_unknown=0):
         self.btn_run.config(state="normal", text="Lancer le rapprochement")
         self.btn_open.config(state="normal")
@@ -613,8 +660,9 @@ class GleifApp(tk.Tk):
             (f"{n_total}",        "Total",              C_ACCENT,  "#E8F0FA"),
             (f"{n_valid}",        "LEI Valide",         C_GREEN,   C_GREEN_BG),
             (f"{n_discordant}",   "LEI Discordant",     C_ORANGE,  C_ORANGE_BG),
-            (f"{n_lei_unknown}",  "LEI invalide/inconnu", C_BLUE,  C_BLUE_BG),
+            (f"{n_lei_unknown}",  "LEI invalide",       C_BLUE,    C_BLUE_BG),
             (f"{n_exact}",        "Exact – RCS",        C_GREEN,   C_GREEN_BG),
+            (f"{n_approx_rcs}",   "Approx – RCS",       C_GREEN,   "#EAF4E4"),
             (f"{n_approx}",       "Approx – Nom",       C_YELLOW,  C_YELLOW_BG),
             (f"{n_miss}",         "Non trouve",         C_RED,     C_RED_BG),
         ]
@@ -651,8 +699,9 @@ class GleifApp(tk.Tk):
             "col_name":        self.v_col_name.get(),
             "col_pays":        self.v_col_pays.get(),
             "col_lei":         self.v_col_lei.get(),
-            "fuzzy_threshold": int(self.v_threshold.get()),
-            "active_only":     bool(self.v_active.get()),
+            "fuzzy_threshold":     int(self.v_threshold.get()),
+            "rcs_fuzzy_threshold": int(self.v_rcs_threshold.get()),
+            "active_only":         bool(self.v_active.get()),
             "use_slim":        bool(self.v_use_slim.get()),
             "proxy":           self.v_proxy.get(),
         })
