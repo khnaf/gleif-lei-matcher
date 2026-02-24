@@ -410,9 +410,8 @@ class GleifApp(tk.Tk):
             from gleif_matcher import (
                 load_gleif, build_indices,
                 search_by_rcs, search_by_name_country, search_by_lei,
-                _check_lei_discordance,
-                normalize_rcs, normalize_name, country_to_iso,
-                _export_excel, _safe_read_excel,
+                _check_lei_discordance, normalize_rcs, normalize_name,
+                country_to_iso, _export_excel, _safe_read_excel,
             )
 
             self._set_status("Lecture du fichier societes...")
@@ -481,9 +480,11 @@ class GleifApp(tk.Tk):
                 # ── Mode 1 : validation LEI existant ─────────────────────────
                 if lei_exist:
                     gleif_row = search_by_lei(lei_exist, lei_index, df_gleif)
+
                     if gleif_row is not None:
+                        # LEI trouvé directement → vérifier cohérence des données
                         disc_text, is_disc = _check_lei_discordance(
-                            gleif_row, rcs_raw, name_raw, iso
+                            gleif_row, rcs_raw, name_raw, iso, client_lei=lei_exist
                         )
                         if is_disc:
                             match_type = "LEI Discordant"
@@ -492,8 +493,28 @@ class GleifApp(tk.Tk):
                             match_type = "LEI Valide"
                             n_valid += 1
                     else:
-                        match_type = "LEI Inconnu – GLEIF"
-                        n_lei_unknown += 1
+                        # LEI introuvable → fallback RCS/nom pour retrouver l'entité
+                        # et comparer le bon LEI avec celui du client
+                        fallback_row = None
+                        if rcs_norm:
+                            fallback_row = search_by_rcs(rcs_norm, rcs_index, df_gleif)
+                        if fallback_row is None and name_norm:
+                            fallback_row, _sc = search_by_name_country(
+                                name_norm, iso, name_index, df_gleif, threshold)
+
+                        if fallback_row is not None:
+                            disc_text, _ = _check_lei_discordance(
+                                fallback_row, rcs_raw, name_raw, iso, client_lei=lei_exist
+                            )
+                            if not disc_text:
+                                g_lei = str(fallback_row.get("lei", "")).strip()
+                                disc_text = f"LEI: client='{lei_exist}' ≠ GLEIF='{g_lei}'"
+                            match_type = "LEI Discordant"
+                            n_discordant += 1
+                            gleif_row = fallback_row
+                        else:
+                            match_type = "Non trouvé (LEI invalide)"
+                            n_lei_unknown += 1
 
                 # ── Mode 2 : recherche d'un LEI manquant ─────────────────────
                 else:
@@ -529,7 +550,7 @@ class GleifApp(tk.Tk):
                         n_miss += 1
 
                 results.append({
-                    "LEI":                      gleif_row["lei"]            if gleif_row is not None else "",
+                    "LEI_GLEIF":                gleif_row["lei"]            if gleif_row is not None else "",
                     "GLEIF_NomLegal":           gleif_row["name"]           if gleif_row is not None else "",
                     "GLEIF_Pays":               gleif_row["country"]        if gleif_row is not None else "",
                     "GLEIF_StatutSociete":      gleif_row["entity_status"]  if gleif_row is not None else "",
@@ -592,7 +613,7 @@ class GleifApp(tk.Tk):
             (f"{n_total}",        "Total",              C_ACCENT,  "#E8F0FA"),
             (f"{n_valid}",        "LEI Valide",         C_GREEN,   C_GREEN_BG),
             (f"{n_discordant}",   "LEI Discordant",     C_ORANGE,  C_ORANGE_BG),
-            (f"{n_lei_unknown}",  "LEI Inconnu GLEIF",  C_BLUE,    C_BLUE_BG),
+            (f"{n_lei_unknown}",  "LEI invalide/inconnu", C_BLUE,  C_BLUE_BG),
             (f"{n_exact}",        "Exact – RCS",        C_GREEN,   C_GREEN_BG),
             (f"{n_approx}",       "Approx – Nom",       C_YELLOW,  C_YELLOW_BG),
             (f"{n_miss}",         "Non trouve",         C_RED,     C_RED_BG),

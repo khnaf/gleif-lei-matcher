@@ -572,21 +572,33 @@ def _check_lei_discordance(
     client_rcs_raw: str,
     client_name_raw: str,
     client_iso: str,
+    client_lei: str = "",
     name_threshold: int = 70,
 ) -> Tuple[str, bool]:
     """
-    Compare les données du client avec celles retournées par GLEIF pour le LEI.
+    Compare les données du client avec celles retournées par GLEIF.
 
-    Règles :
-      - RCS   : comparaison exacte (après normalisation)
-      - Nom   : similarité fuzzy token_sort_ratio ≥ name_threshold (défaut 70 %)
-      - Pays  : comparaison ISO 2 lettres
+    Vérifications effectuées (dans l'ordre) :
+      - LEI    : comparaison exacte client vs GLEIF (utile quand l'entité a été
+                 retrouvée par RCS/nom après échec du lookup direct par LEI)
+      - RCS    : comparaison exacte après normalisation
+      - Nom    : similarité fuzzy token_sort_ratio ≥ name_threshold (défaut 70 %)
+      - Pays   : comparaison ISO alpha-2
 
     Retourne :
       (texte_discordance, is_discordant)
       texte_discordance = "" si aucune divergence détectée
     """
     issues: List[str] = []
+
+    # ── Comparaison LEI (client vs GLEIF) ────────────────────────────────────
+    # Pertinent quand l'entité a été retrouvée par RCS/nom et non par LEI direct
+    lei_client = str(client_lei).strip().upper() if client_lei else ""
+    lei_gleif  = str(gleif_row.get("lei", "")).strip().upper()
+    if lei_client and lei_gleif and lei_client != lei_gleif:
+        issues.append(
+            f"LEI: client='{client_lei.strip()}' ≠ GLEIF='{gleif_row.get('lei', '')}'"
+        )
 
     # ── Vérification RCS ─────────────────────────────────────────────────────
     rcs_client = client_rcs_raw.strip() if client_rcs_raw else ""
@@ -712,9 +724,11 @@ def match_companies(
         # ── Mode 1 : validation d'un LEI existant ────────────────────────────
         if lei_exist:
             gleif_row = search_by_lei(lei_exist, lei_index, df_gleif)
+
             if gleif_row is not None:
+                # LEI trouvé directement → vérifier la cohérence des données
                 disc_text, is_disc = _check_lei_discordance(
-                    gleif_row, rcs_raw, name_raw, iso
+                    gleif_row, rcs_raw, name_raw, iso, client_lei=lei_exist
                 )
                 if is_disc:
                     match_type = "LEI Discordant"
@@ -722,9 +736,39 @@ def match_companies(
                 else:
                     match_type = "LEI Valide"
                     n_valid += 1
+
             else:
-                match_type = "LEI Inconnu – GLEIF"
-                n_lei_unknown += 1
+                # LEI introuvable dans GLEIF → fallback par RCS/nom pour
+                # retrouver l'entité et comparer le bon LEI avec celui du client
+                fallback_row = None
+
+                if rcs_norm:
+                    fallback_row = search_by_rcs(rcs_norm, rcs_index, df_gleif)
+
+                if fallback_row is None and name_norm:
+                    fallback_row, _score = search_by_name_country(
+                        name_norm, iso, name_index, df_gleif, fuzzy_threshold
+                    )
+
+                if fallback_row is not None:
+                    # Entité retrouvée par RCS/nom : le LEI du client est incorrect
+                    disc_text, _ = _check_lei_discordance(
+                        fallback_row, rcs_raw, name_raw, iso, client_lei=lei_exist
+                    )
+                    # La comparaison LEI est toujours présente (client ≠ GLEIF)
+                    # Si pas d'autres écarts, forcer au moins la mention du LEI
+                    if not disc_text:
+                        gleif_lei = str(fallback_row.get("lei", "")).strip()
+                        disc_text = (
+                            f"LEI: client='{lei_exist}' ≠ GLEIF='{gleif_lei}'"
+                        )
+                    match_type = "LEI Discordant"
+                    n_discordant += 1
+                    gleif_row = fallback_row  # on utilise la ligne retrouvée
+                else:
+                    # Introuvable par aucun moyen
+                    match_type = "Non trouvé (LEI invalide)"
+                    n_lei_unknown += 1
 
         # ── Mode 2 : recherche d'un LEI manquant ─────────────────────────────
         else:
@@ -767,7 +811,7 @@ def match_companies(
         # ── Construction de la ligne de résultat ─────────────────────────────
         if gleif_row is not None:
             results.append({
-                "LEI":                      gleif_row["lei"],
+                "LEI_GLEIF":                gleif_row["lei"],
                 "GLEIF_NomLegal":           gleif_row["name"],
                 "GLEIF_Pays":               gleif_row["country"],
                 "GLEIF_StatutSociete":      gleif_row["entity_status"],
@@ -781,7 +825,7 @@ def match_companies(
             })
         else:
             results.append({
-                "LEI": "", "GLEIF_NomLegal": "", "GLEIF_Pays": "",
+                "LEI_GLEIF": "", "GLEIF_NomLegal": "", "GLEIF_Pays": "",
                 "GLEIF_StatutSociete": "", "GLEIF_StatutLEI": "",
                 "GLEIF_AutoriteRegistre": "", "GLEIF_NumRegistre": "",
                 "GLEIF_DateRenouvellement": "",
@@ -840,7 +884,7 @@ def _export_excel(df: pd.DataFrame, output_path: str, threshold: int) -> None:
     dfont  = Font(name="Arial", size=10)
 
     gleif_cols = [
-        "LEI", "GLEIF_NomLegal", "GLEIF_Pays",
+        "LEI_GLEIF", "GLEIF_NomLegal", "GLEIF_Pays",
         "GLEIF_StatutSociete", "GLEIF_StatutLEI",
         "GLEIF_AutoriteRegistre", "GLEIF_NumRegistre",
         "GLEIF_DateRenouvellement",
@@ -881,7 +925,7 @@ def _export_excel(df: pd.DataFrame, output_path: str, threshold: int) -> None:
                 cell.font = Font(name="Arial", size=10, color="C00000", bold=True)
 
     col_widths = {
-        "LEI": 25, "GLEIF_NomLegal": 35, "GLEIF_Pays": 10,
+        "LEI_GLEIF": 25, "GLEIF_NomLegal": 35, "GLEIF_Pays": 10,
         "GLEIF_StatutSociete": 16, "GLEIF_StatutLEI": 14,
         "GLEIF_AutoriteRegistre": 18, "GLEIF_NumRegistre": 20,
         "GLEIF_DateRenouvellement": 22,
@@ -896,15 +940,28 @@ def _export_excel(df: pd.DataFrame, output_path: str, threshold: int) -> None:
 
     ws_legend = wb.create_sheet("Légende")
     legend_rows = [
-        ("Couleur",        "Signification"),
-        ("Vert",           "Correspondance exacte par numéro RCS ou LEI existant valide"),
-        ("Jaune",          f"Correspondance approximative nom/pays (score ≥ {threshold} %)"),
-        ("Orange",         "LEI existant retrouvé dans GLEIF mais données divergentes — vérification requise"),
-        ("Bleu clair",     "LEI existant introuvable dans la base GLEIF"),
-        ("Rouge",          "Aucune correspondance trouvée"),
-        ("", ""),
-        ("LEI_Discordance", "Détail des divergences : RCS / Nom / Pays (en rouge gras si renseigné)"),
+        ("Colonne",             "Description"),
+        ("LEI_Existant",        "LEI présent dans votre base (issu du fichier d'entrée)"),
+        ("LEI_GLEIF",           "LEI retourné par la base GLEIF (validé ou trouvé)"),
+        ("LEI_Discordance",     "Détail des divergences : LEI / RCS / Nom / Pays (rouge gras si renseigné)"),
         ("GLEIF_DateRenouvellement", "Date de prochaine échéance du LEI selon GLEIF"),
+        ("", ""),
+        ("Couleur",             "Signification du type de correspondance"),
+        ("Vert",                "LEI validé (données cohérentes) ou correspondance exacte par RCS"),
+        ("Jaune",               f"Correspondance approximative nom/pays (score ≥ {threshold} %)"),
+        ("Orange",              "LEI Discordant — divergence détectée (LEI erroné, RCS/nom/pays différent)"),
+        ("Bleu clair",          "Non trouvé (LEI invalide) — introuvable même par RCS/nom"),
+        ("Rouge",               "Aucune correspondance trouvée (pas de LEI dans la base d'entrée)"),
+        ("", ""),
+        ("Logique de détection",""),
+        ("1. LEI_Existant fourni + trouvé dans GLEIF",
+         "→ comparaison RCS / Nom / Pays — Valide ou Discordant"),
+        ("2. LEI_Existant fourni + NON trouvé dans GLEIF",
+         "→ fallback par RCS puis nom/pays pour retrouver l'entité\n"
+         "   Si trouvé : LEI Discordant (avec comparaison LEI_client vs LEI_GLEIF)\n"
+         "   Si introuvable : Non trouvé (LEI invalide)"),
+        ("3. Pas de LEI_Existant",
+         "→ recherche par RCS exact, puis approximation nom+pays"),
     ]
     for r, (a, b) in enumerate(legend_rows, 1):
         ws_legend.cell(r, 1, a).font = Font(bold=(r == 1))
