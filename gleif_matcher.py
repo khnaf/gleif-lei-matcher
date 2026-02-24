@@ -330,10 +330,27 @@ def load_gleif(
     # Étape 1 : détecter le schéma en lisant uniquement la première ligne
     header_df = pd.read_csv(gleif_path, nrows=0, dtype=str, low_memory=False)
     available_cols = list(header_df.columns)
-    col_map, _missing = _detect_gleif_columns(available_cols)
 
-    # Colonnes à lire (uniquement celles trouvées → réduit la mémoire ~10x)
-    usecols = list(set(col_map.values()))
+    # Détection du format : slim (colonnes logiques) vs Golden Copy complet
+    # Le slim CSV a des headers comme "lei", "name", "country"…
+    # Le Golden Copy a des headers comme "Entity.LegalName", "Registration.RegistrationStatus"…
+    _slim_markers = {"lei", "name", "country", "entity_status", "lei_status"}
+    is_slim_format = _slim_markers.issubset(set(available_cols))
+
+    if is_slim_format:
+        # ── Format slim : colonnes déjà normalisées, pas de renommage ────────
+        _status("Format slim détecté — chargement direct des colonnes logiques…")
+        usecols = [col for col in SLIM_COLUMNS if col in available_cols]
+        # Ajouter les colonnes slim manquantes (ex: renewal_date absent d'un ancien slim)
+        _missing_slim = [c for c in SLIM_COLUMNS if c not in available_cols]
+        if _missing_slim:
+            log.warning(f"Colonnes absentes du slim (seront vides) : {_missing_slim}")
+        col_map = None  # pas de renommage nécessaire
+    else:
+        # ── Format Golden Copy complet : détecter les noms GLEIF réels ───────
+        col_map, _missing = _detect_gleif_columns(available_cols)
+        usecols = list(set(col_map.values()))
+
     _status(f"Colonnes retenues : {len(usecols)} / {len(available_cols)} — lecture par chunks…")
 
     # Estimation de la taille totale pour la progression
@@ -357,9 +374,12 @@ def load_gleif(
     )
 
     for chunk in reader:
-        rename_map = {v: k for k, v in col_map.items()}
-        chunk = chunk.rename(columns=rename_map)
+        if not is_slim_format and col_map:
+            # Golden Copy : renommer les colonnes GLEIF → noms logiques
+            rename_map = {v: k for k, v in col_map.items()}
+            chunk = chunk.rename(columns=rename_map)
 
+        # Ajouter les colonnes logiques manquantes (vides)
         for logical in SLIM_COLUMNS:
             if logical not in chunk.columns:
                 chunk[logical] = ""
