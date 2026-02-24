@@ -420,6 +420,35 @@ class GleifApp(tk.Tk):
             ):
                 return
 
+        # ── Avertissement base slim + mode validation LEI ────────────────────
+        _col_lei_val = self.v_col_lei.get().strip()
+        if _col_lei_val:
+            _gpath = self.v_gleif.get().strip()
+            if _gpath and Path(_gpath).exists() and _gpath.lower().endswith(".csv"):
+                try:
+                    import pandas as _pd_chk
+                    _hdr_cols = set(
+                        _pd_chk.read_csv(_gpath, nrows=0, dtype=str).columns.tolist()
+                    )
+                    _slim_markers = {"lei", "name", "country", "entity_status", "lei_status"}
+                    if _slim_markers.issubset(_hdr_cols):
+                        if not messagebox.askyesno(
+                            "Base slim + Mode validation LEI",
+                            "⚠ Attention : vous utilisez la base slim avec le mode "
+                            "validation LEI.\n\n"
+                            "La base slim ne contient que les entités ACTIVE+ISSUED.\n"
+                            "Les entreprises avec un LEI expiré (LAPSED) sont absentes "
+                            "de la slim et ne pourront pas être retrouvées par le "
+                            "fallback RCS/nom → résultat : 'Non trouvé (LEI invalide)'.\n\n"
+                            "Pour une couverture complète des LEI expirés :\n"
+                            "  • Utilisez le Golden Copy complet\n"
+                            "  • Ou régénérez la base slim sans filtre 'Actifs uniquement'\n\n"
+                            "Continuer quand même ?",
+                        ):
+                            return
+                except Exception:
+                    pass
+
         for w in self.frame_summary.winfo_children():
             w.destroy()
         self.btn_run.config(state="disabled", text="Traitement en cours...")
@@ -524,6 +553,10 @@ class GleifApp(tk.Tk):
                         fallback_row = None
                         if rcs_norm:
                             fallback_row = search_by_rcs(rcs_norm, rcs_index, df_gleif)
+                            # Fallback RCS approché si exact échoue (même logique que Mode 2)
+                            if fallback_row is None and rcs_threshold < 100:
+                                fallback_row, _fb_rcs_sc = search_by_rcs_fuzzy(
+                                    rcs_norm, rcs_index, df_gleif, rcs_threshold)
                         if fallback_row is None and name_norm:
                             fallback_row, _sc = search_by_name_country(
                                 name_norm, iso, name_index, df_gleif, threshold)

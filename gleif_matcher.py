@@ -340,6 +340,19 @@ def load_gleif(
     if is_slim_format:
         # ── Format slim : colonnes déjà normalisées, pas de renommage ────────
         _status("Format slim détecté — chargement direct des colonnes logiques…")
+        # Avertissement : la slim ne contient que ACTIVE+ISSUED ; en mode validation
+        # (active_only=False), les entités LAPSED sont absentes → fallback limité.
+        if not active_only:
+            _warn = (
+                "⚠  Base slim + mode validation LEI : la slim ne contient que "
+                "les entités ACTIVE+ISSUED. Les entités LAPSED/INACTIVE absentes "
+                "de la slim ne seront pas retrouvées par le fallback RCS/nom. "
+                "Pour une couverture complète des LEI expirés, utilisez le "
+                "Golden Copy complet ou régénérez la slim sans filtre actif."
+            )
+            log.warning(_warn)
+            if status_cb:
+                status_cb("⚠ Base slim : entités LAPSED absentes — validation LEI partielle")
         usecols = [col for col in SLIM_COLUMNS if col in available_cols]
         # Ajouter les colonnes slim manquantes (ex: renewal_date absent d'un ancien slim)
         _missing_slim = [c for c in SLIM_COLUMNS if c not in available_cols]
@@ -837,6 +850,11 @@ def match_companies(
 
                 if rcs_norm:
                     fallback_row = search_by_rcs(rcs_norm, rcs_index, df_gleif)
+                    # Fallback RCS approché si exact échoue (même logique que Mode 2)
+                    if fallback_row is None and rcs_fuzzy_threshold > 0:
+                        fallback_row, _fb_rcs_score = search_by_rcs_fuzzy(
+                            rcs_norm, rcs_index, df_gleif, rcs_fuzzy_threshold
+                        )
 
                 if fallback_row is None and name_norm:
                     fallback_row, _score = search_by_name_country(
