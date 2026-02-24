@@ -590,17 +590,21 @@ def search_by_rcs_fuzzy(
     threshold: int = 88,
 ) -> Tuple[Optional[pd.Series], int]:
     """
-    Recherche approximative par numéro de registre.
+    Recherche approximative par numéro de registre — critère de contenance.
 
     Stratégie :
-      1. Filtre rapide : ne compare que les clés dont la longueur est dans
-         [len(rcs_norm)-2, len(rcs_norm)+2] pour limiter les faux positifs
-         et réduire le nombre de comparaisons.
-      2. Scorer fuzz.ratio (similitude Levenshtein) ≥ threshold.
+      1. Filtre par longueur : seules les clés GLEIF dont la longueur est dans
+         [len(rcs_norm), len(rcs_norm)+2] sont considérées (le RCS client doit
+         être plus court ou égal au RCS GLEIF).
+      2. Contenance : le RCS client doit apparaître en tant que sous-chaîne
+         du RCS GLEIF.
+         → Détecte les caractères manquants dans le référentiel client :
+           "1513210151" ⊆ "01513210151"  (zéro de tête absent du référentiel)
+           "ABCDE123"   ⊆ "XABCDE123"   (préfixe absent)
+      3. Score = len(rcs_client) / len(rcs_gleif) × 100  (≥ threshold requis).
 
-    Exemple :
-      "1513210151" ≈ "1513210151" (même valeur, Unicode différent → corrigé
-      par normalize_rcs avant d'arriver ici ; sinon distance ≥ 90 %).
+    Ce critère est plus strict que fuzz.ratio : deux chaînes de longueurs
+    proches mais de contenu différent ne produiront jamais de faux positif.
 
     Retourne :
       (row, score)  si trouvé,  (None, 0)  sinon.
@@ -609,26 +613,23 @@ def search_by_rcs_fuzzy(
         return None, 0
 
     n = len(rcs_norm)
-    # Pré-filtrage par longueur similaire (±2 caractères)
-    candidates = {
-        k: idxs
-        for k, idxs in rcs_index.items()
-        if abs(len(k) - n) <= 2
-    }
-    if not candidates:
-        return None, 0
+    best_row  = None
+    best_score = 0
 
-    result = process.extractOne(
-        rcs_norm,
-        list(candidates.keys()),
-        scorer=fuzz.ratio,
-        score_cutoff=threshold,
-    )
-    if result is None:
-        return None, 0
+    for key, idxs in rcs_index.items():
+        key_len = len(key)
+        # Filtre longueur : la clé GLEIF doit être ≥ RCS client
+        # et la différence ne peut excéder 2 caractères
+        if key_len < n or (key_len - n) > 2:
+            continue
 
-    best_key, score, _ = result
-    return df.iloc[candidates[best_key][0]], int(score)
+        if rcs_norm in key:
+            score = round(n / key_len * 100)
+            if score >= threshold and score > best_score:
+                best_score = score
+                best_row   = df.iloc[idxs[0]]
+
+    return best_row, best_score
 
 
 def search_by_lei(
@@ -1092,7 +1093,7 @@ def _export_excel(df: pd.DataFrame, output_path: str, threshold: int) -> None:
         ("", ""),
         ("Couleur",             "Signification du type de correspondance"),
         ("Vert foncé",          "LEI validé (données cohérentes) ou correspondance exacte par RCS"),
-        ("Vert clair",          "Correspondance RCS approchée — ScoreCorrespondance = 'RCS:xx% / Nom:yy%'"),
+        ("Vert clair",          "Correspondance RCS approchée — le RCS client est contenu dans le RCS GLEIF (ex: zéro de tête manquant). ScoreCorrespondance = 'RCS:xx% / Nom:yy%'"),
         ("Jaune",               f"Correspondance approximative nom/pays (score ≥ {threshold} %)"),
         ("Orange",              "LEI Discordant — divergence détectée (LEI erroné, RCS/nom/pays différent)"),
         ("Bleu clair",          "Non trouvé (LEI invalide) — introuvable même par RCS/nom"),
@@ -1106,8 +1107,8 @@ def _export_excel(df: pd.DataFrame, output_path: str, threshold: int) -> None:
          "   Si trouvé : LEI Discordant (avec comparaison LEI_client vs LEI_GLEIF)\n"
          "   Si introuvable : Non trouvé (LEI invalide)"),
         ("3. Pas de LEI_Existant",
-         "→ RCS exact, puis RCS approché (zéros de tête, fautes légères),\n"
-         "   puis approximation nom+pays"),
+         "→ RCS exact, puis RCS approché (contenance : RCS client ⊆ RCS GLEIF,\n"
+         "   ex: zéro de tête manquant), puis approximation nom+pays"),
     ]
     for r, (a, b) in enumerate(legend_rows, 1):
         ws_legend.cell(r, 1, a).font = Font(bold=(r == 1))

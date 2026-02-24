@@ -285,7 +285,7 @@ class GleifApp(tk.Tk):
         tk.Label(rcs_hint, text="",
                  bg=C_BG, width=26).pack(side="left")
         tk.Label(rcs_hint,
-                 text="Ex: '1513210151' ≈ '01513210151' (zéro de tête) → détecté à 95%+    |    100% = exact uniquement",
+                 text="Ex: '1513210151' ⊆ '01513210151' (zéro de tête absent) → score 91%    |    100% = exact uniquement",
                  font=("Segoe UI", 8, "italic"), fg=C_SUBTLE, bg=C_BG).pack(side="left")
 
         # Seuil similarité nom/pays
