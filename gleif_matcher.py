@@ -4,22 +4,31 @@ gleif_matcher.py
 Module de rapprochement LEI GLEIF pour fichiers Excel.
 
 Workflow :
-  1. Recherche exacte par numéro RCS (normalisé)
-  2. Si non trouvé → fuzzy matching par nom d'entreprise + pays
-  3. Export Excel enrichi avec colonnes LEI, statut, type de correspondance
+  1. Si colonne LEI_Existant présente et non vide → validation du LEI existant
+       • Lookup direct par code LEI dans GLEIF
+       • Comparaison des données (RCS, nom, pays) → détection de discordance
+  2. Si LEI absent (ou colonne absente) → recherche par RCS puis fuzzy nom/pays
+
+Types de correspondance :
+  LEI Valide          — LEI existant confirmé par GLEIF, données cohérentes
+  LEI Discordant      — LEI existant trouvé dans GLEIF mais données différentes
+  LEI Inconnu – GLEIF — LEI existant introuvable dans la base GLEIF
+  Exact – RCS         — correspondance exacte sur numéro de registre
+  Approx – Nom/Pays   — correspondance approximative sur nom + pays
+  Non trouvé          — aucune correspondance possible
+
+Colonnes de sortie supplémentaires v1.2 :
+  GLEIF_DateRenouvellement — date de prochaine échéance du LEI
+  LEI_Discordance          — détail des divergences détectées
 
 Usage CLI :
   python gleif_matcher.py --input societes.xlsx --gleif gleif_golden_copy.csv --output resultats.xlsx
 
-Colonnes GLEIF attendues (Golden Copy CSV) — variantes gérées automatiquement :
+Colonnes GLEIF gérées automatiquement (variantes selon version Golden Copy) :
   LEI, Entity.LegalName, Entity.LegalAddress.Country,
   Entity.EntityStatus, Registration.RegistrationStatus,
-  Registration.RegistrationAuthorityID  (ou Entity.RegistrationAuthority.*)
-  Registration.RegistrationAuthorityEntityID (ou Entity.RegistrationAuthority.*)
-
-Statuts :
-  Entity.EntityStatus             → ACTIVE / INACTIVE / MERGED  (statut société)
-  Registration.RegistrationStatus → ISSUED / LAPSED / RETIRED   (statut LEI)
+  Registration.RegistrationAuthorityID, Registration.RegistrationAuthorityEntityID,
+  Registration.NextRenewalDate
 """
 
 import argparse
@@ -130,6 +139,11 @@ GLEIF_COLUMN_CANDIDATES: Dict[str, List[str]] = {
         "Entity.RegistrationAuthority.RegistrationAuthorityEntityID",
         "Registration.RegistrationAuthority.RegistrationAuthorityEntityID",
         "RegistrationAuthority.RegistrationAuthorityEntityID",
+    ],
+    "renewal_date": [
+        "Registration.NextRenewalDate",
+        "Registration.NextRenewal",
+        "Entity.Registration.NextRenewalDate",
     ],
 }
 
@@ -301,7 +315,6 @@ def load_gleif(
     # Estimation de la taille totale pour la progression
     try:
         file_size = path.stat().st_size
-        # Estimation grossière : ~200 octets par ligne dans le CSV complet
         estimated_total_chunks = max(1, file_size // (200 * GLEIF_CHUNK_SIZE))
     except Exception:
         estimated_total_chunks = 200  # fallback
@@ -316,22 +329,19 @@ def load_gleif(
         dtype=str,
         low_memory=False,
         chunksize=GLEIF_CHUNK_SIZE,
-        on_bad_lines="skip",   # ignore les lignes malformées plutôt que crash
+        on_bad_lines="skip",
     )
 
     for chunk in reader:
-        # Renommer vers les noms logiques standardisés
         rename_map = {v: k for k, v in col_map.items()}
         chunk = chunk.rename(columns=rename_map)
 
-        # Ajouter les colonnes absentes (non trouvées dans le schéma)
         for logical in SLIM_COLUMNS:
             if logical not in chunk.columns:
                 chunk[logical] = ""
 
         chunk = chunk[SLIM_COLUMNS].fillna("")
 
-        # Filtrage à la volée (évite d'accumuler des données inutiles)
         if active_only:
             mask = (
                 (chunk["entity_status"].str.upper() == "ACTIVE") &
@@ -352,7 +362,6 @@ def load_gleif(
 
     df = pd.concat(chunks, ignore_index=True)
 
-    n_total = chunks_read * GLEIF_CHUNK_SIZE
     _status(
         f"  Chargement terminé : {len(df):,} entités retenues "
         f"({'filtre ACTIVE+ISSUED' if active_only else 'tous statuts'})"
@@ -392,8 +401,8 @@ def prepare_slim(
     """
     Génère un CSV allégé depuis le Golden Copy complet.
 
-    Le slim CSV ne contient que les 7 colonnes utiles et (optionnellement)
-    uniquement les entités ACTIVE + ISSUED. Taille typique : 200-400 Mo → 80-150 Mo.
+    Le slim CSV ne contient que les colonnes utiles (incluant la date de
+    renouvellement) et optionnellement uniquement les entités ACTIVE + ISSUED.
 
     Retourne le nombre de lignes écrites.
     """
@@ -470,13 +479,26 @@ def prepare_slim(
 
 def build_indices(
     df: pd.DataFrame,
-) -> Tuple[Dict[str, List[int]], Dict[str, Dict[str, List[int]]]]:
+) -> Tuple[Dict[str, List[int]], Dict[str, Dict[str, List[int]]], Dict[str, int]]:
+    """
+    Construit trois index de recherche sur le DataFrame GLEIF :
+      rcs_index  : {rcs_normalisé → [indices de lignes]}
+      name_index : {pays_iso → {nom_normalisé → [indices de lignes]}}
+      lei_index  : {code_LEI_upper → indice de ligne}  ← nouveau v1.2
+    """
     log.info("Construction des index …")
     rcs_index: Dict[str, List[int]] = {}
-    for i, row in enumerate(df["ra_entity"]):
-        key = normalize_rcs(row)
-        if key:
-            rcs_index.setdefault(key, []).append(i)
+    lei_index: Dict[str, int] = {}
+
+    for i, (lei, ra_entity) in enumerate(zip(df["lei"], df["ra_entity"])):
+        # Index RCS
+        key_rcs = normalize_rcs(ra_entity)
+        if key_rcs:
+            rcs_index.setdefault(key_rcs, []).append(i)
+        # Index LEI (lookup direct O(1))
+        key_lei = str(lei).strip().upper()
+        if key_lei:
+            lei_index[key_lei] = i
 
     name_index: Dict[str, Dict[str, List[int]]] = {}
     for i, (country, name) in enumerate(zip(df["country"], df["name"])):
@@ -487,9 +509,10 @@ def build_indices(
 
     log.info(
         f"  Index RCS : {len(rcs_index):,} entrées | "
+        f"Index LEI : {len(lei_index):,} entrées | "
         f"Index noms : {sum(len(v) for v in name_index.values()):,} entrées"
     )
-    return rcs_index, name_index
+    return rcs_index, name_index, lei_index
 
 
 def search_by_rcs(
@@ -501,6 +524,19 @@ def search_by_rcs(
         return None
     indices = rcs_index.get(rcs_norm)
     return df.iloc[indices[0]] if indices else None
+
+
+def search_by_lei(
+    lei_val: str,
+    lei_index: Dict[str, int],
+    df: pd.DataFrame,
+) -> Optional[pd.Series]:
+    """Lookup direct par code LEI (O(1))."""
+    key = str(lei_val).strip().upper()
+    if not key:
+        return None
+    idx = lei_index.get(key)
+    return df.iloc[idx] if idx is not None else None
 
 
 def search_by_name_country(
@@ -528,6 +564,64 @@ def search_by_name_country(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Vérification de discordance pour un LEI existant
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _check_lei_discordance(
+    gleif_row: pd.Series,
+    client_rcs_raw: str,
+    client_name_raw: str,
+    client_iso: str,
+    name_threshold: int = 70,
+) -> Tuple[str, bool]:
+    """
+    Compare les données du client avec celles retournées par GLEIF pour le LEI.
+
+    Règles :
+      - RCS   : comparaison exacte (après normalisation)
+      - Nom   : similarité fuzzy token_sort_ratio ≥ name_threshold (défaut 70 %)
+      - Pays  : comparaison ISO 2 lettres
+
+    Retourne :
+      (texte_discordance, is_discordant)
+      texte_discordance = "" si aucune divergence détectée
+    """
+    issues: List[str] = []
+
+    # ── Vérification RCS ─────────────────────────────────────────────────────
+    rcs_client = client_rcs_raw.strip() if client_rcs_raw else ""
+    if rcs_client:
+        rcs_norm_c = normalize_rcs(rcs_client)
+        rcs_norm_g = normalize_rcs(str(gleif_row.get("ra_entity", "")))
+        if rcs_norm_c and rcs_norm_g and rcs_norm_c != rcs_norm_g:
+            issues.append(
+                f"RCS: client='{rcs_client}' ≠ GLEIF='{gleif_row.get('ra_entity', '')}'"
+            )
+
+    # ── Vérification Nom ─────────────────────────────────────────────────────
+    name_client = client_name_raw.strip() if client_name_raw else ""
+    if name_client:
+        name_norm_c = normalize_name(name_client)
+        name_norm_g = normalize_name(str(gleif_row.get("name", "")))
+        if name_norm_c and name_norm_g:
+            score = fuzz.token_sort_ratio(name_norm_c, name_norm_g)
+            if score < name_threshold:
+                issues.append(
+                    f"Nom: client='{name_client}' ≠ GLEIF='{gleif_row.get('name', '')}' "
+                    f"(similarité={score}%)"
+                )
+
+    # ── Vérification Pays ────────────────────────────────────────────────────
+    if client_iso and client_iso.strip():
+        country_g = str(gleif_row.get("country", "")).strip().upper()
+        if country_g and client_iso.upper() != country_g:
+            issues.append(f"Pays: client={client_iso} ≠ GLEIF={country_g}")
+
+    disc_text = " | ".join(issues)
+    return disc_text, bool(issues)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Pipeline de rapprochement principal
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -538,12 +632,25 @@ def match_companies(
     col_rcs: str = "RCS",
     col_name: str = "NomEntreprise",
     col_pays: str = "Pays",
+    col_lei: Optional[str] = None,          # ← NOUVEAU v1.2 : colonne LEI existant
     fuzzy_threshold: int = 80,
     active_only: bool = True,
     progress_cb: Optional[Callable[[int, int], None]] = None,
     status_cb: Optional[Callable[[str], None]] = None,
 ) -> pd.DataFrame:
+    """
+    Pipeline complet de rapprochement.
 
+    Paramètres
+    ----------
+    col_lei : nom de la colonne contenant les LEI existants (optionnel).
+              Si présente et non vide pour une ligne → mode validation LEI.
+              Si absente ou vide → mode recherche (RCS puis fuzzy nom/pays).
+
+    Note : quand col_lei est fourni, le chargement GLEIF ignore le filtre
+    active_only afin de retrouver même les LEI expirés (LAPSED / INACTIVE).
+    Le statut réel est reporté dans GLEIF_StatutSociete et GLEIF_StatutLEI.
+    """
     def _status(msg):
         log.info(msg)
         if status_cb:
@@ -553,72 +660,134 @@ def match_companies(
     df_input = _safe_read_excel(input_path).fillna("")
     _status(f"  {len(df_input):,} lignes chargées")
 
-    missing_cols = [c for c in [col_rcs, col_name, col_pays] if c not in df_input.columns]
+    # Validation des colonnes obligatoires
+    required = [c for c in [col_rcs, col_name, col_pays] if c]
+    missing_cols = [c for c in required if c not in df_input.columns]
     if missing_cols:
         raise ValueError(
             f"Colonnes manquantes dans le fichier d'entrée : {missing_cols}\n"
             f"Colonnes disponibles : {list(df_input.columns)}"
         )
 
+    # Détermination du mode LEI
+    has_lei_col = bool(col_lei) and col_lei in df_input.columns
+    if has_lei_col:
+        _status(
+            f"  Colonne LEI détectée : '{col_lei}' — mode validation activé.\n"
+            "  Chargement de tous les statuts GLEIF pour retrouver les LEI expirés."
+        )
+
+    # Chargement GLEIF
+    # Si mode validation LEI : charger TOUS les statuts (pour trouver les LAPSED)
+    _active_only_load = active_only if not has_lei_col else False
     df_gleif = load_gleif(
         gleif_path,
-        active_only=active_only,
+        active_only=_active_only_load,
         status_cb=status_cb,
     )
-    rcs_index, name_index = build_indices(df_gleif)
+    rcs_index, name_index, lei_index = build_indices(df_gleif)
 
     results = []
     n_total = len(df_input)
     n_exact = n_approx = n_miss = 0
+    n_valid = n_discordant = n_lei_unknown = 0
 
     _status("Rapprochement en cours …")
 
     for idx, row in df_input.iterrows():
-        rcs_norm  = normalize_rcs(str(row[col_rcs]))
-        name_norm = normalize_name(str(row[col_name]))
-        iso       = country_to_iso(str(row[col_pays]))
+        rcs_raw   = str(row[col_rcs]).strip()  if col_rcs  in df_input.columns else ""
+        name_raw  = str(row[col_name]).strip() if col_name in df_input.columns else ""
+        pays_raw  = str(row[col_pays]).strip() if col_pays in df_input.columns else ""
+        lei_exist = str(row[col_lei]).strip()  if has_lei_col else ""
 
-        gleif_row  = None
-        match_type = "Non trouvé"
+        rcs_norm  = normalize_rcs(rcs_raw)
+        name_norm = normalize_name(name_raw)
+        iso       = country_to_iso(pays_raw)
+
+        gleif_row   = None
+        match_type  = "Non trouvé"
         match_score = ""
+        disc_text   = ""
 
-        if rcs_norm:
-            gleif_row = search_by_rcs(rcs_norm, rcs_index, df_gleif)
+        # ── Mode 1 : validation d'un LEI existant ────────────────────────────
+        if lei_exist:
+            gleif_row = search_by_lei(lei_exist, lei_index, df_gleif)
             if gleif_row is not None:
-                match_type  = "Exact – RCS"
-                match_score = 100
-                n_exact    += 1
+                disc_text, is_disc = _check_lei_discordance(
+                    gleif_row, rcs_raw, name_raw, iso
+                )
+                if is_disc:
+                    match_type = "LEI Discordant"
+                    n_discordant += 1
+                else:
+                    match_type = "LEI Valide"
+                    n_valid += 1
+            else:
+                match_type = "LEI Inconnu – GLEIF"
+                n_lei_unknown += 1
 
-        if gleif_row is None and name_norm:
-            gleif_row, score = search_by_name_country(
-                name_norm, iso, name_index, df_gleif, fuzzy_threshold
-            )
-            if gleif_row is not None:
-                match_type  = "Approx – Nom/Pays"
-                match_score = score
-                n_approx   += 1
+        # ── Mode 2 : recherche d'un LEI manquant ─────────────────────────────
+        else:
+            # Recherche par RCS
+            if rcs_norm:
+                gleif_row = search_by_rcs(rcs_norm, rcs_index, df_gleif)
+                if gleif_row is not None:
+                    # Vérification active_only (le DF peut contenir tous statuts)
+                    if active_only:
+                        es = str(gleif_row.get("entity_status", "")).upper()
+                        ls = str(gleif_row.get("lei_status", "")).upper()
+                        if es != "ACTIVE" or ls != "ISSUED":
+                            gleif_row = None
+                    if gleif_row is not None:
+                        match_type  = "Exact – RCS"
+                        match_score = 100
+                        n_exact    += 1
 
-        if gleif_row is None:
-            n_miss += 1
+            # Fallback fuzzy nom/pays
+            if gleif_row is None and name_norm:
+                gleif_row, score = search_by_name_country(
+                    name_norm, iso, name_index, df_gleif, fuzzy_threshold
+                )
+                if gleif_row is not None:
+                    # Vérification active_only
+                    if active_only:
+                        es = str(gleif_row.get("entity_status", "")).upper()
+                        ls = str(gleif_row.get("lei_status", "")).upper()
+                        if es != "ACTIVE" or ls != "ISSUED":
+                            gleif_row = None
+                            score = 0
+                    if gleif_row is not None:
+                        match_type  = "Approx – Nom/Pays"
+                        match_score = score
+                        n_approx   += 1
 
+            if gleif_row is None:
+                n_miss += 1
+
+        # ── Construction de la ligne de résultat ─────────────────────────────
         if gleif_row is not None:
             results.append({
-                "LEI":                    gleif_row["lei"],
-                "GLEIF_NomLegal":         gleif_row["name"],
-                "GLEIF_Pays":             gleif_row["country"],
-                "GLEIF_StatutSociete":    gleif_row["entity_status"],
-                "GLEIF_StatutLEI":        gleif_row["lei_status"],
-                "GLEIF_AutoriteRegistre": gleif_row["ra_id"],
-                "GLEIF_NumRegistre":      gleif_row["ra_entity"],
-                "TypeCorrespondance":     match_type,
-                "ScoreCorrespondance":    match_score,
+                "LEI":                      gleif_row["lei"],
+                "GLEIF_NomLegal":           gleif_row["name"],
+                "GLEIF_Pays":               gleif_row["country"],
+                "GLEIF_StatutSociete":      gleif_row["entity_status"],
+                "GLEIF_StatutLEI":          gleif_row["lei_status"],
+                "GLEIF_AutoriteRegistre":   gleif_row["ra_id"],
+                "GLEIF_NumRegistre":        gleif_row["ra_entity"],
+                "GLEIF_DateRenouvellement": gleif_row["renewal_date"],
+                "TypeCorrespondance":       match_type,
+                "ScoreCorrespondance":      match_score,
+                "LEI_Discordance":          disc_text,
             })
         else:
             results.append({
                 "LEI": "", "GLEIF_NomLegal": "", "GLEIF_Pays": "",
                 "GLEIF_StatutSociete": "", "GLEIF_StatutLEI": "",
                 "GLEIF_AutoriteRegistre": "", "GLEIF_NumRegistre": "",
-                "TypeCorrespondance": match_type, "ScoreCorrespondance": "",
+                "GLEIF_DateRenouvellement": "",
+                "TypeCorrespondance":  match_type,
+                "ScoreCorrespondance": "",
+                "LEI_Discordance":     "",
             })
 
         if progress_cb and ((idx + 1) % 10 == 0 or (idx + 1) == n_total):
@@ -631,12 +800,15 @@ def match_companies(
     _export_excel(df_output, output_path, fuzzy_threshold)
 
     log.info(
-        f"\n{'='*50}\n"
-        f"  Total        : {n_total:>6,}\n"
-        f"  Exact RCS    : {n_exact:>6,}  ({n_exact/n_total*100:.1f}%)\n"
-        f"  Approx Nom   : {n_approx:>6,}  ({n_approx/n_total*100:.1f}%)\n"
-        f"  Non trouvé   : {n_miss:>6,}  ({n_miss/n_total*100:.1f}%)\n"
-        f"{'='*50}"
+        f"\n{'='*55}\n"
+        f"  Total             : {n_total:>6,}\n"
+        f"  LEI Valide        : {n_valid:>6,}  ({n_valid/n_total*100:.1f}%)\n"
+        f"  LEI Discordant    : {n_discordant:>6,}  ({n_discordant/n_total*100:.1f}%)\n"
+        f"  LEI Inconnu GLEIF : {n_lei_unknown:>6,}  ({n_lei_unknown/n_total*100:.1f}%)\n"
+        f"  Exact RCS         : {n_exact:>6,}  ({n_exact/n_total*100:.1f}%)\n"
+        f"  Approx Nom        : {n_approx:>6,}  ({n_approx/n_total*100:.1f}%)\n"
+        f"  Non trouvé        : {n_miss:>6,}  ({n_miss/n_total*100:.1f}%)\n"
+        f"{'='*55}"
     )
     return df_output
 
@@ -654,11 +826,13 @@ def _export_excel(df: pd.DataFrame, output_path: str, threshold: int) -> None:
     ws = wb.active
     ws.title = "Résultats LEI"
 
-    HEADER_FILL = PatternFill("solid", fgColor="1F4E79")
-    GLEIF_FILL  = PatternFill("solid", fgColor="D6E4F0")
-    EXACT_FILL  = PatternFill("solid", fgColor="D9EAD3")
-    APPROX_FILL = PatternFill("solid", fgColor="FFF2CC")
-    MISS_FILL   = PatternFill("solid", fgColor="FCE4D6")
+    HEADER_FILL   = PatternFill("solid", fgColor="1F4E79")
+    GLEIF_FILL    = PatternFill("solid", fgColor="D6E4F0")
+    EXACT_FILL    = PatternFill("solid", fgColor="D9EAD3")   # vert  → Exact RCS / LEI Valide
+    APPROX_FILL   = PatternFill("solid", fgColor="FFF2CC")   # jaune → Approx Nom/Pays
+    DISCORD_FILL  = PatternFill("solid", fgColor="FCE8D0")   # orange → LEI Discordant
+    UNKNOWN_FILL  = PatternFill("solid", fgColor="DAE8FC")   # bleu clair → LEI Inconnu GLEIF
+    MISS_FILL     = PatternFill("solid", fgColor="FCE4D6")   # rouge → Non trouvé
 
     thin   = Side(style="thin", color="AAAAAA")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
@@ -669,7 +843,9 @@ def _export_excel(df: pd.DataFrame, output_path: str, threshold: int) -> None:
         "LEI", "GLEIF_NomLegal", "GLEIF_Pays",
         "GLEIF_StatutSociete", "GLEIF_StatutLEI",
         "GLEIF_AutoriteRegistre", "GLEIF_NumRegistre",
+        "GLEIF_DateRenouvellement",
         "TypeCorrespondance", "ScoreCorrespondance",
+        "LEI_Discordance",
     ]
     columns = list(df.columns)
 
@@ -682,25 +858,35 @@ def _export_excel(df: pd.DataFrame, output_path: str, threshold: int) -> None:
 
     for ri, row in enumerate(df.itertuples(index=False), 2):
         mt = getattr(row, "TypeCorrespondance", "")
-        rf = EXACT_FILL if mt == "Exact – RCS" else \
-             APPROX_FILL if mt == "Approx – Nom/Pays" else \
-             MISS_FILL   if mt == "Non trouvé" else None
+        if mt in ("Exact – RCS", "LEI Valide"):
+            rf = EXACT_FILL
+        elif mt == "Approx – Nom/Pays":
+            rf = APPROX_FILL
+        elif mt == "LEI Discordant":
+            rf = DISCORD_FILL
+        elif mt == "LEI Inconnu – GLEIF":
+            rf = UNKNOWN_FILL
+        else:
+            rf = MISS_FILL
 
         for ci, (cn, val) in enumerate(zip(columns, row), 1):
             cell = ws.cell(row=ri, column=ci, value=val)
-            cell.font   = dfont
-            cell.border = border
+            cell.font      = dfont
+            cell.border    = border
             cell.alignment = Alignment(vertical="center")
-            if cn in gleif_cols and rf:
+            if cn in gleif_cols:
                 cell.fill = rf
-            elif cn in gleif_cols:
-                cell.fill = GLEIF_FILL
+            # Mise en évidence de la colonne LEI_Discordance si non vide
+            if cn == "LEI_Discordance" and val:
+                cell.font = Font(name="Arial", size=10, color="C00000", bold=True)
 
     col_widths = {
         "LEI": 25, "GLEIF_NomLegal": 35, "GLEIF_Pays": 10,
         "GLEIF_StatutSociete": 16, "GLEIF_StatutLEI": 14,
         "GLEIF_AutoriteRegistre": 18, "GLEIF_NumRegistre": 20,
-        "TypeCorrespondance": 20, "ScoreCorrespondance": 12,
+        "GLEIF_DateRenouvellement": 22,
+        "TypeCorrespondance": 22, "ScoreCorrespondance": 12,
+        "LEI_Discordance": 55,
     }
     for ci, cn in enumerate(columns, 1):
         ws.column_dimensions[get_column_letter(ci)].width = col_widths.get(cn, 22)
@@ -709,17 +895,22 @@ def _export_excel(df: pd.DataFrame, output_path: str, threshold: int) -> None:
     ws.freeze_panes = "A2"
 
     ws_legend = wb.create_sheet("Légende")
-    for r, (a, b) in enumerate([
-        ("Couleur", "Signification"),
-        ("Vert",    "Correspondance exacte par numéro RCS"),
-        (f"Jaune",  f"Correspondance approximative nom/pays (score ≥ {threshold})"),
-        ("Rouge",   "Aucune correspondance trouvée"),
-        ("Bleu",    "Colonnes issues de la base GLEIF"),
-    ], 1):
+    legend_rows = [
+        ("Couleur",        "Signification"),
+        ("Vert",           "Correspondance exacte par numéro RCS ou LEI existant valide"),
+        ("Jaune",          f"Correspondance approximative nom/pays (score ≥ {threshold} %)"),
+        ("Orange",         "LEI existant retrouvé dans GLEIF mais données divergentes — vérification requise"),
+        ("Bleu clair",     "LEI existant introuvable dans la base GLEIF"),
+        ("Rouge",          "Aucune correspondance trouvée"),
+        ("", ""),
+        ("LEI_Discordance", "Détail des divergences : RCS / Nom / Pays (en rouge gras si renseigné)"),
+        ("GLEIF_DateRenouvellement", "Date de prochaine échéance du LEI selon GLEIF"),
+    ]
+    for r, (a, b) in enumerate(legend_rows, 1):
         ws_legend.cell(r, 1, a).font = Font(bold=(r == 1))
         ws_legend.cell(r, 2, b).font = Font(bold=(r == 1))
-    ws_legend.column_dimensions["A"].width = 15
-    ws_legend.column_dimensions["B"].width = 55
+    ws_legend.column_dimensions["A"].width = 25
+    ws_legend.column_dimensions["B"].width = 65
 
     wb.save(output_path)
 
@@ -729,13 +920,15 @@ def _export_excel(df: pd.DataFrame, output_path: str, threshold: int) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _parse_args():
-    p = argparse.ArgumentParser(description="GLEIF LEI Matcher")
+    p = argparse.ArgumentParser(description="GLEIF LEI Matcher v1.2")
     p.add_argument("--input",             required=True)
     p.add_argument("--gleif",             required=True)
     p.add_argument("--output",            required=True)
     p.add_argument("--col-rcs",           default="RCS")
     p.add_argument("--col-name",          default="NomEntreprise")
     p.add_argument("--col-pays",          default="Pays")
+    p.add_argument("--col-lei",           default=None,
+                   help="Colonne LEI existant dans le fichier d'entrée (ex: LEI_Existant)")
     p.add_argument("--fuzzy-threshold",   type=int, default=80)
     p.add_argument("--active-only",       action="store_true", default=True)
     p.add_argument("--all-statuses",      dest="active_only", action="store_false")
@@ -763,6 +956,7 @@ if __name__ == "__main__":
         col_rcs         = args.col_rcs,
         col_name        = args.col_name,
         col_pays        = args.col_pays,
+        col_lei         = args.col_lei,
         fuzzy_threshold = args.fuzzy_threshold,
         active_only     = args.active_only,
     )

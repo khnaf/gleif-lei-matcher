@@ -1,8 +1,13 @@
 """
 gleif_gui.py
 ============
-Interface graphique tkinter pour GLEIF LEI Matcher.
+Interface graphique tkinter pour GLEIF LEI Matcher v1.2.
 Double-clic sur LANCER.bat (Windows) pour démarrer.
+
+Nouveautés v1.2 :
+  - Champ optionnel « Colonne LEI existant » pour le mode validation
+  - Résumé étendu : LEI Valide / LEI Discordant / LEI Inconnu GLEIF
+  - Date de renouvellement dans le fichier de sortie
 
 Dépendances : pandas openpyxl rapidfuzz  (installées automatiquement par LANCER.bat)
 """
@@ -29,7 +34,8 @@ USER_PREFS_PATH  = Path.home() / ".gleif_matcher_prefs.json"
 def load_config() -> dict:
     defaults = {
         "gleif_path": "", "col_rcs": "RCS", "col_name": "NomEntreprise",
-        "col_pays": "Pays", "fuzzy_threshold": 80, "active_only": True,
+        "col_pays": "Pays", "col_lei": "LEI_Existant",
+        "fuzzy_threshold": 80, "active_only": True,
         "last_input": "", "last_output": "", "use_slim": False,
     }
     if TEAM_CONFIG_PATH.exists():
@@ -59,21 +65,25 @@ def save_user_prefs(prefs: dict) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # Palette couleurs
 # ─────────────────────────────────────────────────────────────────────────────
-C_BG        = "#F5F7FA"
-C_PANEL     = "#FFFFFF"
-C_ACCENT    = "#1F4E79"
-C_ACCENT2   = "#2E75B6"
-C_TEXT      = "#2C2C2C"
-C_SUBTLE    = "#6B7280"
-C_GREEN     = "#1E7E34"
-C_YELLOW    = "#856404"
-C_RED       = "#842029"
-C_GREEN_BG  = "#D4EDDA"
-C_YELLOW_BG = "#FFF3CD"
-C_RED_BG    = "#F8D7DA"
-C_BORDER    = "#D1D5DB"
-C_WARN_BG   = "#FFF3CD"
-C_WARN_FG   = "#856404"
+C_BG         = "#F5F7FA"
+C_PANEL      = "#FFFFFF"
+C_ACCENT     = "#1F4E79"
+C_ACCENT2    = "#2E75B6"
+C_TEXT       = "#2C2C2C"
+C_SUBTLE     = "#6B7280"
+C_GREEN      = "#1E7E34"
+C_YELLOW     = "#856404"
+C_ORANGE     = "#8B4513"
+C_BLUE       = "#1F4E79"
+C_RED        = "#842029"
+C_GREEN_BG   = "#D4EDDA"
+C_YELLOW_BG  = "#FFF3CD"
+C_ORANGE_BG  = "#FCE8D0"
+C_BLUE_BG    = "#DAE8FC"
+C_RED_BG     = "#F8D7DA"
+C_BORDER     = "#D1D5DB"
+C_WARN_BG    = "#FFF3CD"
+C_WARN_FG    = "#856404"
 
 
 def _browse_file(var, title, filetypes, save=False):
@@ -100,7 +110,7 @@ class GleifApp(tk.Tk):
         self.title("GLEIF LEI Matcher")
         self.resizable(False, False)
         self.configure(bg=C_BG)
-        self._center_window(800, 720)
+        self._center_window(800, 780)
 
         cfg = load_config()
 
@@ -110,6 +120,7 @@ class GleifApp(tk.Tk):
         self.v_col_rcs    = tk.StringVar(value=cfg.get("col_rcs",  "RCS"))
         self.v_col_name   = tk.StringVar(value=cfg.get("col_name", "NomEntreprise"))
         self.v_col_pays   = tk.StringVar(value=cfg.get("col_pays", "Pays"))
+        self.v_col_lei    = tk.StringVar(value=cfg.get("col_lei",  "LEI_Existant"))
         self.v_threshold  = tk.IntVar(value=int(cfg.get("fuzzy_threshold", 80)))
         self.v_active     = tk.BooleanVar(value=bool(cfg.get("active_only", True)))
         self.v_use_slim   = tk.BooleanVar(value=bool(cfg.get("use_slim", False)))
@@ -152,7 +163,7 @@ class GleifApp(tk.Tk):
         header = tk.Frame(self, bg=C_ACCENT, height=56)
         header.pack(fill="x")
         tk.Label(
-            header, text="  GLEIF LEI Matcher",
+            header, text="  GLEIF LEI Matcher  v1.2",
             font=("Segoe UI", 14, "bold"), fg="white", bg=C_ACCENT, anchor="w",
         ).pack(fill="x", padx=20, pady=12)
 
@@ -189,7 +200,7 @@ class GleifApp(tk.Tk):
         # Option base slim
         slim_row = tk.Frame(body, bg=C_BG)
         slim_row.pack(fill="x", pady=2)
-        tk.Label(slim_row, text="", bg=C_BG, width=26).pack(side="left")  # alignement
+        tk.Label(slim_row, text="", bg=C_BG, width=26).pack(side="left")
         ttk.Checkbutton(
             slim_row,
             text="Utiliser la base slim  (gleif_slim.csv — plus rapide, moins de mémoire)",
@@ -203,6 +214,7 @@ class GleifApp(tk.Tk):
         self._section(body, "Noms des colonnes  (fichier sociétés)")
         cols_frame = tk.Frame(body, bg=C_BG)
         cols_frame.pack(fill="x")
+
         for label, var in [
             ("Colonne RCS",            self.v_col_rcs),
             ("Colonne Nom entreprise", self.v_col_name),
@@ -214,6 +226,37 @@ class GleifApp(tk.Tk):
                      fg=C_TEXT, bg=C_BG, width=26, anchor="w").pack(side="left")
             ttk.Entry(row, textvariable=var, width=28,
                       font=("Segoe UI", 10)).pack(side="left", padx=(4, 0))
+
+        # Colonne LEI existant (optionnelle)
+        lei_col_row = tk.Frame(cols_frame, bg=C_BG)
+        lei_col_row.pack(fill="x", pady=2)
+        tk.Label(
+            lei_col_row,
+            text="Colonne LEI existant",
+            font=("Segoe UI", 10), fg=C_TEXT, bg=C_BG, width=26, anchor="w",
+        ).pack(side="left")
+        ttk.Entry(
+            lei_col_row, textvariable=self.v_col_lei, width=28,
+            font=("Segoe UI", 10),
+        ).pack(side="left", padx=(4, 4))
+        tk.Label(
+            lei_col_row,
+            text="(optionnel — laisser vide si pas de LEI en base)",
+            font=("Segoe UI", 8, "italic"), fg=C_SUBTLE, bg=C_BG,
+        ).pack(side="left")
+
+        # Bulle d'info mode validation
+        info_row = tk.Frame(body, bg="#EEF4FF", padx=8, pady=4)
+        info_row.pack(fill="x", pady=(2, 0))
+        tk.Label(
+            info_row,
+            text=(
+                "ℹ  Si la colonne LEI existant est renseignée :\n"
+                "   • Lignes avec LEI → validation : comparaison GLEIF vs votre base (RCS, nom, pays)\n"
+                "   • Lignes sans LEI → recherche normale (RCS puis nom approché)"
+            ),
+            font=("Segoe UI", 8), fg="#1F4E79", bg="#EEF4FF", justify="left", anchor="w",
+        ).pack(fill="x")
 
         ttk.Separator(body, orient="horizontal").pack(fill="x", pady=10)
 
@@ -239,7 +282,8 @@ class GleifApp(tk.Tk):
         chk_row.pack(fill="x", pady=4)
         ttk.Checkbutton(
             chk_row,
-            text="LEI actifs uniquement  (Entity=ACTIVE & LEI=ISSUED)",
+            text="LEI actifs uniquement  (Entity=ACTIVE & LEI=ISSUED)  "
+                 "— désactivé automatiquement en mode validation",
             variable=self.v_active,
         ).pack(side="left")
 
@@ -364,9 +408,11 @@ class GleifApp(tk.Tk):
         try:
             import pandas as pd
             from gleif_matcher import (
-                load_gleif, build_indices, search_by_rcs, search_by_name_country,
-                normalize_rcs, normalize_name, country_to_iso, _export_excel,
-                _safe_read_excel,
+                load_gleif, build_indices,
+                search_by_rcs, search_by_name_country, search_by_lei,
+                _check_lei_discordance,
+                normalize_rcs, normalize_name, country_to_iso,
+                _export_excel, _safe_read_excel,
             )
 
             self._set_status("Lecture du fichier societes...")
@@ -374,18 +420,20 @@ class GleifApp(tk.Tk):
                 df_input = _safe_read_excel(self.v_input.get()).fillna("")
             except PermissionError:
                 self._show_error(
-                    f"Impossible de lire le fichier societes.\n\n"
-                    f"Si le fichier est dans OneDrive Entreprise :\n"
-                    f"  . Assurez-vous qu'il est telecharge localement (icone dans l'Explorateur)\n"
-                    f"  . Ou copiez-le dans un dossier local avant traitement."
+                    "Impossible de lire le fichier societes.\n\n"
+                    "Si le fichier est dans OneDrive Entreprise :\n"
+                    "  . Assurez-vous qu'il est telecharge localement\n"
+                    "  . Ou copiez-le dans un dossier local avant traitement."
                 )
                 return
 
-            n_total = len(df_input)
+            n_total  = len(df_input)
             col_rcs  = self.v_col_rcs.get().strip()
             col_name = self.v_col_name.get().strip()
             col_pays = self.v_col_pays.get().strip()
+            col_lei  = self.v_col_lei.get().strip() or None
 
+            # Vérification colonnes obligatoires
             missing = [c for c in [col_rcs, col_name, col_pays] if c not in df_input.columns]
             if missing:
                 self._show_error(
@@ -394,72 +442,124 @@ class GleifApp(tk.Tk):
                 )
                 return
 
+            # Détermination du mode LEI
+            has_lei_col = bool(col_lei) and col_lei in df_input.columns
+            active_only = bool(self.v_active.get())
+            # En mode validation, charger tous les statuts pour trouver les LEI expirés
+            _active_only_load = active_only if not has_lei_col else False
+
             self._set_status("Chargement de la base GLEIF...")
             df_gleif = load_gleif(
                 self.v_gleif.get(),
-                active_only=self.v_active.get(),
+                active_only=_active_only_load,
                 status_cb=self._set_status,
             )
 
             self._set_status("Construction des index...")
-            rcs_index, name_index = build_indices(df_gleif)
+            rcs_index, name_index, lei_index = build_indices(df_gleif)
 
             threshold = int(self.v_threshold.get())
             results = []
             n_exact = n_approx = n_miss = 0
+            n_valid = n_discordant = n_lei_unknown = 0
 
             for idx, row in df_input.iterrows():
-                rcs_norm  = normalize_rcs(str(row[col_rcs]))
-                name_norm = normalize_name(str(row[col_name]))
-                iso       = country_to_iso(str(row[col_pays]))
+                rcs_raw   = str(row[col_rcs]).strip()  if col_rcs  in df_input.columns else ""
+                name_raw  = str(row[col_name]).strip() if col_name in df_input.columns else ""
+                pays_raw  = str(row[col_pays]).strip() if col_pays in df_input.columns else ""
+                lei_exist = str(row[col_lei]).strip()  if has_lei_col else ""
 
-                gleif_row  = None
-                match_type = "Non trouve"
+                rcs_norm  = normalize_rcs(rcs_raw)
+                name_norm = normalize_name(name_raw)
+                iso       = country_to_iso(pays_raw)
+
+                gleif_row   = None
+                match_type  = "Non trouve"
                 match_score = ""
+                disc_text   = ""
 
-                if rcs_norm:
-                    gleif_row = search_by_rcs(rcs_norm, rcs_index, df_gleif)
+                # ── Mode 1 : validation LEI existant ─────────────────────────
+                if lei_exist:
+                    gleif_row = search_by_lei(lei_exist, lei_index, df_gleif)
                     if gleif_row is not None:
-                        match_type  = "Exact – RCS"
-                        match_score = 100
-                        n_exact    += 1
+                        disc_text, is_disc = _check_lei_discordance(
+                            gleif_row, rcs_raw, name_raw, iso
+                        )
+                        if is_disc:
+                            match_type = "LEI Discordant"
+                            n_discordant += 1
+                        else:
+                            match_type = "LEI Valide"
+                            n_valid += 1
+                    else:
+                        match_type = "LEI Inconnu – GLEIF"
+                        n_lei_unknown += 1
 
-                if gleif_row is None and name_norm:
-                    gleif_row, score = search_by_name_country(
-                        name_norm, iso, name_index, df_gleif, threshold)
-                    if gleif_row is not None:
-                        match_type  = "Approx – Nom/Pays"
-                        match_score = score
-                        n_approx   += 1
+                # ── Mode 2 : recherche d'un LEI manquant ─────────────────────
+                else:
+                    if rcs_norm:
+                        gleif_row = search_by_rcs(rcs_norm, rcs_index, df_gleif)
+                        if gleif_row is not None:
+                            if active_only:
+                                es = str(gleif_row.get("entity_status", "")).upper()
+                                ls = str(gleif_row.get("lei_status", "")).upper()
+                                if es != "ACTIVE" or ls != "ISSUED":
+                                    gleif_row = None
+                            if gleif_row is not None:
+                                match_type  = "Exact – RCS"
+                                match_score = 100
+                                n_exact    += 1
 
-                if gleif_row is None:
-                    n_miss += 1
+                    if gleif_row is None and name_norm:
+                        gleif_row, score = search_by_name_country(
+                            name_norm, iso, name_index, df_gleif, threshold)
+                        if gleif_row is not None:
+                            if active_only:
+                                es = str(gleif_row.get("entity_status", "")).upper()
+                                ls = str(gleif_row.get("lei_status", "")).upper()
+                                if es != "ACTIVE" or ls != "ISSUED":
+                                    gleif_row = None
+                                    score = 0
+                            if gleif_row is not None:
+                                match_type  = "Approx – Nom/Pays"
+                                match_score = score
+                                n_approx   += 1
+
+                    if gleif_row is None:
+                        n_miss += 1
 
                 results.append({
-                    "LEI":                    gleif_row["lei"]           if gleif_row is not None else "",
-                    "GLEIF_NomLegal":         gleif_row["name"]          if gleif_row is not None else "",
-                    "GLEIF_Pays":             gleif_row["country"]       if gleif_row is not None else "",
-                    "GLEIF_StatutSociete":    gleif_row["entity_status"] if gleif_row is not None else "",
-                    "GLEIF_StatutLEI":        gleif_row["lei_status"]    if gleif_row is not None else "",
-                    "GLEIF_AutoriteRegistre": gleif_row["ra_id"]         if gleif_row is not None else "",
-                    "GLEIF_NumRegistre":      gleif_row["ra_entity"]     if gleif_row is not None else "",
-                    "TypeCorrespondance":     match_type,
-                    "ScoreCorrespondance":    match_score,
+                    "LEI":                      gleif_row["lei"]            if gleif_row is not None else "",
+                    "GLEIF_NomLegal":           gleif_row["name"]           if gleif_row is not None else "",
+                    "GLEIF_Pays":               gleif_row["country"]        if gleif_row is not None else "",
+                    "GLEIF_StatutSociete":      gleif_row["entity_status"]  if gleif_row is not None else "",
+                    "GLEIF_StatutLEI":          gleif_row["lei_status"]     if gleif_row is not None else "",
+                    "GLEIF_AutoriteRegistre":   gleif_row["ra_id"]          if gleif_row is not None else "",
+                    "GLEIF_NumRegistre":        gleif_row["ra_entity"]      if gleif_row is not None else "",
+                    "GLEIF_DateRenouvellement": gleif_row["renewal_date"]   if gleif_row is not None else "",
+                    "TypeCorrespondance":       match_type,
+                    "ScoreCorrespondance":      match_score,
+                    "LEI_Discordance":          disc_text,
                 })
 
                 if (idx + 1) % 10 == 0 or (idx + 1) == n_total:
-                    pct = (idx + 1) / n_total * 100
+                    n_ok  = n_exact + n_approx + n_valid
+                    n_ko  = n_discordant + n_lei_unknown + n_miss
+                    pct   = (idx + 1) / n_total * 100
                     self._update_progress(
                         pct,
                         f"Traitement : {idx+1}/{n_total}  —  "
-                        f"OK {n_exact}  APPROX {n_approx}  MISS {n_miss}"
+                        f"OK {n_ok}  DISC {n_discordant}  MISS {n_ko}"
                     )
 
             self._set_status("Export Excel...")
             df_results = pd.DataFrame(results)
             df_output  = pd.concat([df_input.reset_index(drop=True), df_results], axis=1)
             _export_excel(df_output, self.v_output.get(), threshold)
-            self.after(0, lambda: self._show_summary(n_total, n_exact, n_approx, n_miss))
+            self.after(0, lambda: self._show_summary(
+                n_total, n_exact, n_approx, n_miss,
+                n_valid, n_discordant, n_lei_unknown
+            ))
 
         except Exception as exc:
             self._show_error(str(exc))
@@ -480,24 +580,29 @@ class GleifApp(tk.Tk):
             self.v_status_msg.set("Erreur — voir le message ci-dessus.")
         self.after(0, _s)
 
-    def _show_summary(self, n_total, n_exact, n_approx, n_miss):
+    def _show_summary(self, n_total, n_exact, n_approx, n_miss,
+                      n_valid=0, n_discordant=0, n_lei_unknown=0):
         self.btn_run.config(state="normal", text="Lancer le rapprochement")
         self.btn_open.config(state="normal")
         self.v_progress.set(100)
         self.v_status_msg.set("Traitement termine — fichier Excel genere.")
         self._save_prefs()
+
         cards = [
-            (f"{n_total}", "Total",        C_ACCENT,  "#E8F0FA"),
-            (f"{n_exact}", "Exact – RCS",  C_GREEN,   C_GREEN_BG),
-            (f"{n_approx}","Approx – Nom", C_YELLOW,  C_YELLOW_BG),
-            (f"{n_miss}",  "Non trouve",   C_RED,     C_RED_BG),
+            (f"{n_total}",        "Total",              C_ACCENT,  "#E8F0FA"),
+            (f"{n_valid}",        "LEI Valide",         C_GREEN,   C_GREEN_BG),
+            (f"{n_discordant}",   "LEI Discordant",     C_ORANGE,  C_ORANGE_BG),
+            (f"{n_lei_unknown}",  "LEI Inconnu GLEIF",  C_BLUE,    C_BLUE_BG),
+            (f"{n_exact}",        "Exact – RCS",        C_GREEN,   C_GREEN_BG),
+            (f"{n_approx}",       "Approx – Nom",       C_YELLOW,  C_YELLOW_BG),
+            (f"{n_miss}",         "Non trouve",         C_RED,     C_RED_BG),
         ]
         for val, label, fg, bg in cards:
             card = tk.Frame(self.frame_summary, bg=bg,
                             highlightbackground=C_BORDER, highlightthickness=1)
-            card.pack(side="left", padx=(0, 10), ipadx=14, ipady=8)
-            tk.Label(card, text=val,   font=("Segoe UI", 20, "bold"), fg=fg, bg=bg).pack()
-            tk.Label(card, text=label, font=("Segoe UI", 9),           fg=fg, bg=bg).pack()
+            card.pack(side="left", padx=(0, 6), ipadx=10, ipady=6)
+            tk.Label(card, text=val,   font=("Segoe UI", 16, "bold"), fg=fg, bg=bg).pack()
+            tk.Label(card, text=label, font=("Segoe UI", 8),           fg=fg, bg=bg).pack()
 
     def _open_result(self):
         path = self.v_output.get()
@@ -524,6 +629,7 @@ class GleifApp(tk.Tk):
             "col_rcs":         self.v_col_rcs.get(),
             "col_name":        self.v_col_name.get(),
             "col_pays":        self.v_col_pays.get(),
+            "col_lei":         self.v_col_lei.get(),
             "fuzzy_threshold": int(self.v_threshold.get()),
             "active_only":     bool(self.v_active.get()),
             "use_slim":        bool(self.v_use_slim.get()),
@@ -554,14 +660,14 @@ class UpdateDialog(tk.Toplevel):
         self.transient(parent)
         self.grab_set()
 
-        self.v_gleif_path   = v_gleif_path
-        self.v_proxy        = v_proxy
-        self.v_progress     = tk.DoubleVar(value=0)
-        self.v_slim_progress= tk.DoubleVar(value=0)
-        self.v_status       = tk.StringVar(value="Pret.")
-        self.v_prepare_slim = tk.BooleanVar(value=False)
-        self._running       = False
-        self._meta          = None
+        self.v_gleif_path    = v_gleif_path
+        self.v_proxy         = v_proxy
+        self.v_progress      = tk.DoubleVar(value=0)
+        self.v_slim_progress = tk.DoubleVar(value=0)
+        self.v_status        = tk.StringVar(value="Pret.")
+        self.v_prepare_slim  = tk.BooleanVar(value=False)
+        self._running        = False
+        self._meta           = None
 
         self._build_ui()
         self._center(parent, 580, 480)
