@@ -558,6 +558,7 @@ class GleifApp(tk.Tk):
             results = []
             n_exact = n_approx_rcs = n_approx = n_miss = 0
             n_valid = n_discordant = n_lei_unknown = 0
+            n_dq = 0  # lignes avec ≥1 anomalie DQ (Disc_* non vide)
 
             for idx, row in df_input.iterrows():
                 rcs_raw    = str(row[col_rcs]).strip()    if col_rcs    in df_input.columns else ""
@@ -688,6 +689,10 @@ class GleifApp(tk.Tk):
                             client_lei=lei_exist, client_date_raw=date_raw,
                             client_postal_raw=postal_raw)
 
+                # Comptage des anomalies DQ (au moins un champ Disc_* non vide)
+                if any(disc.values()):
+                    n_dq += 1
+
                 results.append({
                     "LEI_GLEIF":                gleif_row["lei"]                      if gleif_row is not None else "",
                     "GLEIF_NomLegal":           gleif_row["name"]                     if gleif_row is not None else "",
@@ -708,13 +713,13 @@ class GleifApp(tk.Tk):
                 })
 
                 if (idx + 1) % 10 == 0 or (idx + 1) == n_total:
-                    n_ok  = n_exact + n_approx_rcs + n_approx + n_valid
-                    n_ko  = n_discordant + n_lei_unknown + n_miss
-                    pct   = (idx + 1) / n_total * 100
+                    n_trouve = n_exact + n_approx_rcs + n_approx + n_valid + n_discordant
+                    n_miss_t = n_lei_unknown + n_miss
+                    pct      = (idx + 1) / n_total * 100
                     self._update_progress(
                         pct,
                         f"Traitement : {idx+1}/{n_total}  —  "
-                        f"OK {n_ok}  DISC {n_discordant}  MISS {n_ko}"
+                        f"Trouvé {n_trouve}  Anom.DQ {n_dq}  Non trouvé {n_miss_t}"
                     )
 
             self._set_status("Export Excel...")
@@ -723,7 +728,7 @@ class GleifApp(tk.Tk):
             _export_excel(df_output, self.v_output.get(), threshold)
             self.after(0, lambda: self._show_summary(
                 n_total, n_exact, n_approx_rcs, n_approx, n_miss,
-                n_valid, n_discordant, n_lei_unknown
+                n_valid, n_discordant, n_lei_unknown, n_dq
             ))
 
         except Exception as exc:
@@ -746,7 +751,7 @@ class GleifApp(tk.Tk):
         self.after(0, _s)
 
     def _show_summary(self, n_total, n_exact, n_approx_rcs=0, n_approx=0, n_miss=0,
-                      n_valid=0, n_discordant=0, n_lei_unknown=0):
+                      n_valid=0, n_discordant=0, n_lei_unknown=0, n_dq=0):
         self.btn_run.config(state="normal", text="Lancer le rapprochement")
         self.btn_open.config(state="normal")
         self.v_progress.set(100)
@@ -754,14 +759,18 @@ class GleifApp(tk.Tk):
         self._save_prefs()
 
         cards = [
-            (f"{n_total}",        "Total",              C_ACCENT,  "#E8F0FA"),
-            (f"{n_valid}",        "LEI Valide",         C_GREEN,   C_GREEN_BG),
-            (f"{n_discordant}",   "LEI Discordant",     C_ORANGE,  C_ORANGE_BG),
-            (f"{n_lei_unknown}",  "LEI invalide",       C_BLUE,    C_BLUE_BG),
-            (f"{n_exact}",        "Exact – RCS",        C_GREEN,   C_GREEN_BG),
-            (f"{n_approx_rcs}",   "Approx – RCS",       C_GREEN,   "#EAF4E4"),
-            (f"{n_approx}",       "Approx – Nom",       C_YELLOW,  C_YELLOW_BG),
-            (f"{n_miss}",         "Non trouve",         C_RED,     C_RED_BG),
+            # ── Vue DQ globale ───────────────────────────────────────────────
+            (f"{n_total}",                "Total",          C_ACCENT,  "#E8F0FA"),
+            (f"{n_dq}",                   "Anomalies DQ",   C_ORANGE,  C_ORANGE_BG),
+            (f"{n_miss + n_lei_unknown}", "Non trouvé",     C_RED,     C_RED_BG),
+            # ── Détail par type de correspondance ────────────────────────────
+            (f"{n_valid}",        "LEI Valide",             C_GREEN,   C_GREEN_BG),
+            (f"{n_discordant}",   "LEI Discordant",         C_ORANGE,  C_ORANGE_BG),
+            (f"{n_lei_unknown}",  "LEI invalide",           C_BLUE,    C_BLUE_BG),
+            (f"{n_exact}",        "Exact – RCS",            C_GREEN,   C_GREEN_BG),
+            (f"{n_approx_rcs}",   "Approx – RCS",           C_GREEN,   "#EAF4E4"),
+            (f"{n_approx}",       "Approx – Nom",           C_YELLOW,  C_YELLOW_BG),
+            (f"{n_miss}",         "Non trouvé (0 match)",   C_RED,     C_RED_BG),
         ]
         for val, label, fg, bg in cards:
             card = tk.Frame(self.frame_summary, bg=bg,
