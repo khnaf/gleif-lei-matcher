@@ -575,7 +575,7 @@ class GleifApp(tk.Tk):
                 gleif_row   = None
                 match_type  = "Non trouve"
                 match_score = ""
-                disc_text   = ""
+                disc: dict  = {"lei": "", "rcs": "", "nom": "", "date": "", "postal": ""}
 
                 # ── Mode 1 : validation LEI existant ─────────────────────────
                 if lei_exist:
@@ -592,7 +592,7 @@ class GleifApp(tk.Tk):
                             match_type = "LEI Valide"
                             n_valid += 1
                         # Tous les écarts DQ (LEI + RCS + Nom + Date + CP)
-                        disc_text = _check_data_gaps(
+                        disc = _check_data_gaps(
                             gleif_row, rcs_raw, name_raw, iso,
                             client_lei=lei_exist, client_date_raw=date_raw,
                             client_postal_raw=postal_raw)
@@ -613,7 +613,7 @@ class GleifApp(tk.Tk):
                             gleif_row  = fallback_row
                             match_type = "LEI Discordant"
                             n_discordant += 1
-                            disc_text = _check_data_gaps(
+                            disc = _check_data_gaps(
                                 gleif_row, rcs_raw, name_raw, iso,
                                 client_lei=lei_exist, client_date_raw=date_raw,
                                 client_postal_raw=postal_raw)
@@ -683,24 +683,28 @@ class GleifApp(tk.Tk):
                         n_miss += 1
                     else:
                         # Écarts DQ pour tous les types de correspondance Mode 2
-                        disc_text = _check_data_gaps(
+                        disc = _check_data_gaps(
                             gleif_row, rcs_raw, name_raw, iso,
                             client_lei=lei_exist, client_date_raw=date_raw,
                             client_postal_raw=postal_raw)
 
                 results.append({
-                    "LEI_GLEIF":                gleif_row["lei"]            if gleif_row is not None else "",
-                    "GLEIF_NomLegal":           gleif_row["name"]           if gleif_row is not None else "",
-                    "GLEIF_Pays":               gleif_row["country"]        if gleif_row is not None else "",
-                    "GLEIF_StatutSociete":      gleif_row["entity_status"]  if gleif_row is not None else "",
-                    "GLEIF_StatutLEI":          gleif_row["lei_status"]     if gleif_row is not None else "",
-                    "GLEIF_AutoriteRegistre":   gleif_row["ra_id"]          if gleif_row is not None else "",
-                    "GLEIF_NumRegistre":        gleif_row["ra_entity"]      if gleif_row is not None else "",
-                    "GLEIF_DateRenouvellement": gleif_row["renewal_date"]              if gleif_row is not None else "",
+                    "LEI_GLEIF":                gleif_row["lei"]                      if gleif_row is not None else "",
+                    "GLEIF_NomLegal":           gleif_row["name"]                     if gleif_row is not None else "",
+                    "GLEIF_Pays":               gleif_row["country"]                  if gleif_row is not None else "",
+                    "GLEIF_StatutSociete":      gleif_row["entity_status"]            if gleif_row is not None else "",
+                    "GLEIF_StatutLEI":          gleif_row["lei_status"]               if gleif_row is not None else "",
+                    "GLEIF_AutoriteRegistre":   gleif_row["ra_id"]                    if gleif_row is not None else "",
+                    "GLEIF_NumRegistre":        gleif_row["ra_entity"]                if gleif_row is not None else "",
+                    "GLEIF_DateRenouvellement": gleif_row["renewal_date"]             if gleif_row is not None else "",
                     "GLEIF_CodePostal":         gleif_row.get("postal_code", "")      if gleif_row is not None else "",
                     "TypeCorrespondance":       match_type,
                     "ScoreCorrespondance":      match_score,
-                    "LEI_Discordance":          disc_text,
+                    "Disc_LEI":                 disc["lei"],
+                    "Disc_RCS":                 disc["rcs"],
+                    "Disc_Nom":                 disc["nom"],
+                    "Disc_Date":                disc["date"],
+                    "Disc_CodePostal":          disc["postal"],
                 })
 
                 if (idx + 1) % 10 == 0 or (idx + 1) == n_total:

@@ -970,33 +970,32 @@ def _check_data_gaps(
     client_date_raw: str = "",
     client_postal_raw: str = "",
     name_threshold: int = 70,
-) -> str:
+) -> Dict[str, str]:
     """
     Détecte et décrit tous les écarts entre le référentiel client et GLEIF.
 
     Contrôles effectués pour tous les types de correspondance :
-      1. LEI       — manquant côté client  OU  différent de GLEIF
-      2. RCS       — manquant côté client  OU  différent (après normalisation)
-      3. Nom       — similarité < name_threshold (seulement si les deux ont une valeur)
-      4. Date      — manquante côté client OU  différente de GLEIF (après normalisation)
-      5. Code postal — chiffres client non contenus dans le code postal GLEIF
+      1. LEI        — manquant côté client  OU  différent de GLEIF
+      2. RCS        — manquant côté client  OU  différent (après normalisation)
+      3. Nom        — similarité < name_threshold (seulement si les deux ont une valeur)
+      4. Date       — manquante côté client OU  différente de GLEIF (après normalisation)
+      5. CodePostal — vrais écarts (chiffres différents) OU écart de format
+                      (chiffres identiques mais libellé différent, ex: '1338' vs 'L-1338')
 
-    Retourne une chaîne décrivant tous les écarts, vide si aucun.
-    Utilisée pour alimenter la colonne LEI_Discordance dans tous les cas
-    (LEI Valide, Exact RCS, Approx RCS, Approx Nom/Pays, LEI Discordant…).
+    Retourne un dictionnaire {clé → message} avec les clés :
+      "lei", "rcs", "nom", "date", "postal"
+    Chaque valeur est vide ("") si aucun écart n'est détecté sur ce champ.
     """
-    issues: List[str] = []
+    disc: Dict[str, str] = {"lei": "", "rcs": "", "nom": "", "date": "", "postal": ""}
 
     # ── 1. LEI ───────────────────────────────────────────────────────────────
     lei_client = str(client_lei).strip().upper() if client_lei else ""
     lei_gleif_raw = str(gleif_row.get("lei", "")).strip()
     lei_gleif = lei_gleif_raw.upper()
     if not lei_client and lei_gleif:
-        issues.append(f"LEI manquant → GLEIF: '{lei_gleif_raw}'")
+        disc["lei"] = f"LEI manquant → GLEIF: '{lei_gleif_raw}'"
     elif lei_client and lei_gleif and lei_client != lei_gleif:
-        issues.append(
-            f"LEI: client='{client_lei.strip()}' ≠ GLEIF='{lei_gleif_raw}'"
-        )
+        disc["lei"] = f"LEI: client='{client_lei.strip()}' ≠ GLEIF='{lei_gleif_raw}'"
 
     # ── 2. RCS ───────────────────────────────────────────────────────────────
     rcs_client_clean = str(client_rcs_raw).strip() if client_rcs_raw else ""
@@ -1004,9 +1003,9 @@ def _check_data_gaps(
     rcs_norm_c = normalize_rcs(rcs_client_clean) if rcs_client_clean else ""
     rcs_norm_g = normalize_rcs(rcs_gleif_raw)    if rcs_gleif_raw    else ""
     if not rcs_norm_c and rcs_norm_g:
-        issues.append(f"RCS manquant → GLEIF: '{rcs_gleif_raw}'")
+        disc["rcs"] = f"RCS manquant → GLEIF: '{rcs_gleif_raw}'"
     elif rcs_norm_c and rcs_norm_g and rcs_norm_c != rcs_norm_g:
-        issues.append(f"RCS: client='{rcs_client_clean}' ≠ GLEIF='{rcs_gleif_raw}'")
+        disc["rcs"] = f"RCS: client='{rcs_client_clean}' ≠ GLEIF='{rcs_gleif_raw}'"
 
     # ── 3. Nom légal ─────────────────────────────────────────────────────────
     name_client_clean = str(client_name_raw).strip() if client_name_raw else ""
@@ -1017,7 +1016,7 @@ def _check_data_gaps(
         if n_c and n_g:
             score = fuzz.token_sort_ratio(n_c, n_g)
             if score < name_threshold:
-                issues.append(
+                disc["nom"] = (
                     f"Nom: client='{name_client_clean}' ≠ GLEIF='{name_gleif_clean}' "
                     f"(sim={score}%)"
                 )
@@ -1027,30 +1026,36 @@ def _check_data_gaps(
     date_gleif     = normalize_date(date_gleif_raw)
     date_client    = normalize_date(client_date_raw) if client_date_raw else None
     if not date_client and date_gleif:
-        issues.append(
-            f"Date LEI manquante → GLEIF: '{date_gleif.strftime('%d-%m-%Y')}'"
-        )
+        disc["date"] = f"Date LEI manquante → GLEIF: '{date_gleif.strftime('%d-%m-%Y')}'"
     elif date_client and date_gleif and date_client != date_gleif:
-        issues.append(
+        disc["date"] = (
             f"Date LEI: client='{date_client.strftime('%d-%m-%Y')}' "
             f"≠ GLEIF='{date_gleif.strftime('%d-%m-%Y')}'"
         )
 
     # ── 5. Code postal ────────────────────────────────────────────────────────
-    # Règle : les chiffres du code postal client doivent être contenus dans
-    # le code postal GLEIF brut (ex: "1338" ⊆ "L-1338").
-    postal_gleif_raw   = str(gleif_row.get("postal_code", "")).strip()
+    # Deux niveaux d'écart détectés :
+    #   a) Vrais écarts      : chiffres client ∉ code postal GLEIF
+    #   b) Écart de format   : chiffres identiques mais libellé différent
+    #      (ex : client='1338', GLEIF='L-1338') → à harmoniser dans le référentiel
+    postal_gleif_raw    = str(gleif_row.get("postal_code", "")).strip()
     postal_client_clean = str(client_postal_raw).strip() if client_postal_raw else ""
     postal_client_digits = normalize_postal_code(postal_client_clean) if postal_client_clean else ""
     if postal_client_digits and postal_gleif_raw:
         if postal_client_digits not in postal_gleif_raw:
-            issues.append(
+            # Vrai écart : codes postaux différents
+            disc["postal"] = (
                 f"CP: client='{postal_client_clean}' ≠ GLEIF='{postal_gleif_raw}'"
             )
-    elif postal_client_digits and not postal_gleif_raw:
-        pass  # GLEIF n'a pas de code postal pour cette entité → on n'alerte pas
+        elif postal_client_clean != postal_gleif_raw:
+            # Format différent mais chiffres identiques → signaler pour harmonisation DQ
+            disc["postal"] = (
+                f"Format CP: client='{postal_client_clean}' → GLEIF='{postal_gleif_raw}' "
+                f"(à harmoniser)"
+            )
+    # Si GLEIF n'a pas de code postal : pas d'alerte
 
-    return " | ".join(issues)
+    return disc
 
 
 def _check_lei_discordance(
@@ -1230,7 +1235,7 @@ def match_companies(
         gleif_row   = None
         match_type  = "Non trouvé"
         match_score = ""
-        disc_text   = ""
+        disc: Dict[str, str] = {"lei": "", "rcs": "", "nom": "", "date": "", "postal": ""}
 
         # ── Mode 1 : validation d'un LEI existant ────────────────────────────
         if lei_exist:
@@ -1247,7 +1252,7 @@ def match_companies(
                     match_type = "LEI Valide"
                     n_valid += 1
                 # Tous les écarts DQ pour cette ligne (LEI + RCS + Nom + Date + CP)
-                disc_text = _check_data_gaps(
+                disc = _check_data_gaps(
                     gleif_row, rcs_raw, name_raw, iso,
                     client_lei=lei_exist, client_date_raw=date_raw,
                     client_postal_raw=postal_raw,
@@ -1276,7 +1281,7 @@ def match_companies(
                     match_type = "LEI Discordant"
                     n_discordant += 1
                     # Tous les écarts DQ (_check_data_gaps inclut la comparaison LEI)
-                    disc_text = _check_data_gaps(
+                    disc = _check_data_gaps(
                         gleif_row, rcs_raw, name_raw, iso,
                         client_lei=lei_exist, client_date_raw=date_raw,
                         client_postal_raw=postal_raw,
@@ -1360,7 +1365,7 @@ def match_companies(
                 n_miss += 1
             else:
                 # Écarts DQ pour tous les types de correspondance Mode 2
-                disc_text = _check_data_gaps(
+                disc = _check_data_gaps(
                     gleif_row, rcs_raw, name_raw, iso,
                     client_lei=lei_exist, client_date_raw=date_raw,
                     client_postal_raw=postal_raw,
@@ -1380,7 +1385,11 @@ def match_companies(
                 "GLEIF_CodePostal":         gleif_row.get("postal_code", ""),
                 "TypeCorrespondance":       match_type,
                 "ScoreCorrespondance":      match_score,
-                "LEI_Discordance":          disc_text,
+                "Disc_LEI":                 disc["lei"],
+                "Disc_RCS":                 disc["rcs"],
+                "Disc_Nom":                 disc["nom"],
+                "Disc_Date":                disc["date"],
+                "Disc_CodePostal":          disc["postal"],
             })
         else:
             results.append({
@@ -1390,7 +1399,8 @@ def match_companies(
                 "GLEIF_DateRenouvellement": "", "GLEIF_CodePostal": "",
                 "TypeCorrespondance":  match_type,
                 "ScoreCorrespondance": "",
-                "LEI_Discordance":     "",
+                "Disc_LEI": "", "Disc_RCS": "", "Disc_Nom": "",
+                "Disc_Date": "", "Disc_CodePostal": "",
             })
 
         if progress_cb and ((idx + 1) % 10 == 0 or (idx + 1) == n_total):
@@ -1450,8 +1460,9 @@ def _export_excel(df: pd.DataFrame, output_path: str, threshold: int) -> None:
         "GLEIF_AutoriteRegistre", "GLEIF_NumRegistre",
         "GLEIF_DateRenouvellement", "GLEIF_CodePostal",
         "TypeCorrespondance", "ScoreCorrespondance",
-        "LEI_Discordance",
+        "Disc_LEI", "Disc_RCS", "Disc_Nom", "Disc_Date", "Disc_CodePostal",
     ]
+    disc_cols = {"Disc_LEI", "Disc_RCS", "Disc_Nom", "Disc_Date", "Disc_CodePostal"}
     columns = list(df.columns)
 
     for ci, cn in enumerate(columns, 1):
@@ -1483,8 +1494,8 @@ def _export_excel(df: pd.DataFrame, output_path: str, threshold: int) -> None:
             cell.alignment = Alignment(vertical="center")
             if cn in gleif_cols:
                 cell.fill = rf
-            # Mise en évidence de la colonne LEI_Discordance si non vide
-            if cn == "LEI_Discordance" and val:
+            # Colonnes Disc_* : rouge gras si non vide
+            if cn in disc_cols and val:
                 cell.font = Font(name="Arial", size=10, color="C00000", bold=True)
 
     col_widths = {
@@ -1493,7 +1504,8 @@ def _export_excel(df: pd.DataFrame, output_path: str, threshold: int) -> None:
         "GLEIF_AutoriteRegistre": 18, "GLEIF_NumRegistre": 20,
         "GLEIF_DateRenouvellement": 22, "GLEIF_CodePostal": 18,
         "TypeCorrespondance": 22, "ScoreCorrespondance": 12,
-        "LEI_Discordance": 55,
+        "Disc_LEI": 42, "Disc_RCS": 42, "Disc_Nom": 55,
+        "Disc_Date": 48, "Disc_CodePostal": 45,
     }
     for ci, cn in enumerate(columns, 1):
         ws.column_dimensions[get_column_letter(ci)].width = col_widths.get(cn, 22)
@@ -1506,10 +1518,19 @@ def _export_excel(df: pd.DataFrame, output_path: str, threshold: int) -> None:
         ("Colonne",             "Description"),
         ("LEI_Existant",        "LEI présent dans votre base (issu du fichier d'entrée)"),
         ("LEI_GLEIF",           "LEI retourné par la base GLEIF (validé ou trouvé)"),
-        ("LEI_Discordance",     "Détail des divergences : LEI / RCS / Nom / Date / Code Postal (rouge gras si renseigné)"),
         ("GLEIF_DateRenouvellement", "Date de prochaine échéance du LEI selon GLEIF"),
         ("GLEIF_CodePostal",     "Code postal de l'entité tel qu'enregistré dans GLEIF"),
         ("ScoreCorrespondance", "Score de correspondance : 'Nom:xx% / CP:✓' ou 'Nom:xx% / CP:✗' pour Approx Nom/Pays"),
+        ("", ""),
+        ("Colonnes Disc_* (rouge gras si anomalie détectée)", ""),
+        ("Disc_LEI",       "Anomalie sur le LEI : manquant côté client OU différent de GLEIF"),
+        ("Disc_RCS",       "Anomalie sur le RCS : manquant côté client OU différent (après normalisation)"),
+        ("Disc_Nom",       "Anomalie sur le nom : similarité fuzzy < seuil DQ (70 %)"),
+        ("Disc_Date",      "Anomalie sur la date LEI : manquante côté client OU différente de GLEIF"),
+        ("Disc_CodePostal","Anomalie sur le code postal :\n"
+         "  • Vrai écart : chiffres différents  ex: client='75001' ≠ GLEIF='1000'\n"
+         "  • Écart de format : chiffres identiques, libellé différent\n"
+         "    ex: client='1338' → GLEIF='L-1338' (à harmoniser dans votre référentiel)"),
         ("", ""),
         ("Couleur",             "Signification du type de correspondance"),
         ("Vert foncé",          "LEI validé (données cohérentes) ou correspondance exacte par RCS"),
@@ -1533,7 +1554,7 @@ def _export_excel(df: pd.DataFrame, output_path: str, threshold: int) -> None:
         ("Code postal",         ""),
         ("Règle de contenance", "Les chiffres du code postal client doivent être contenus\n"
          "dans le code postal GLEIF brut (ex: '1338' ⊆ 'L-1338').\n"
-         "CP:✓ = correspondance, CP:✗ = écart (signalé dans LEI_Discordance)"),
+         "CP:✓ = correspondance, CP:✗ = écart (signalé dans Disc_CodePostal)"),
     ]
     for r, (a, b) in enumerate(legend_rows, 1):
         ws_legend.cell(r, 1, a).font = Font(bold=(r == 1))
