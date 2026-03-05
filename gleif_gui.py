@@ -110,7 +110,7 @@ class GleifApp(tk.Tk):
         self.title("GLEIF LEI Matcher")
         self.resizable(False, False)
         self.configure(bg=C_BG)
-        self._center_window(800, 780)
+        self._center_window(800, 820)
 
         cfg = load_config()
 
@@ -121,7 +121,8 @@ class GleifApp(tk.Tk):
         self.v_col_name   = tk.StringVar(value=cfg.get("col_name", "NomEntreprise"))
         self.v_col_pays   = tk.StringVar(value=cfg.get("col_pays", "Pays"))
         self.v_col_lei    = tk.StringVar(value=cfg.get("col_lei",  "LEI_Existant"))
-        self.v_col_date   = tk.StringVar(value=cfg.get("col_date", "LEI_DateValidite"))
+        self.v_col_date   = tk.StringVar(value=cfg.get("col_date",   "LEI_DateValidite"))
+        self.v_col_postal = tk.StringVar(value=cfg.get("col_postal", "CodePostal"))
         self.v_threshold      = tk.IntVar(value=int(cfg.get("fuzzy_threshold", 80)))
         self.v_rcs_threshold  = tk.IntVar(value=int(cfg.get("rcs_fuzzy_threshold", 88)))
         self.v_active         = tk.BooleanVar(value=bool(cfg.get("active_only", True)))
@@ -165,7 +166,7 @@ class GleifApp(tk.Tk):
         header = tk.Frame(self, bg=C_ACCENT, height=56)
         header.pack(fill="x")
         tk.Label(
-            header, text="  GLEIF LEI Matcher  v1.2",
+            header, text="  GLEIF LEI Matcher  v1.5",
             font=("Segoe UI", 14, "bold"), fg="white", bg=C_ACCENT, anchor="w",
         ).pack(fill="x", padx=20, pady=12)
 
@@ -262,6 +263,24 @@ class GleifApp(tk.Tk):
         tk.Label(
             date_col_row,
             text="(optionnel — format dd-mm-yyyy dans votre base)",
+            font=("Segoe UI", 8, "italic"), fg=C_SUBTLE, bg=C_BG,
+        ).pack(side="left")
+
+        # Colonne code postal (optionnelle)
+        postal_col_row = tk.Frame(cols_frame, bg=C_BG)
+        postal_col_row.pack(fill="x", pady=2)
+        tk.Label(
+            postal_col_row,
+            text="Colonne Code Postal",
+            font=("Segoe UI", 10), fg=C_TEXT, bg=C_BG, width=26, anchor="w",
+        ).pack(side="left")
+        ttk.Entry(
+            postal_col_row, textvariable=self.v_col_postal, width=28,
+            font=("Segoe UI", 10),
+        ).pack(side="left", padx=(4, 4))
+        tk.Label(
+            postal_col_row,
+            text="(optionnel — affine le matching nom/pays, ex: '1338' ⊆ 'L-1338')",
             font=("Segoe UI", 8, "italic"), fg=C_SUBTLE, bg=C_BG,
         ).pack(side="left")
 
@@ -482,7 +501,7 @@ class GleifApp(tk.Tk):
             from gleif_matcher import (
                 load_gleif, build_indices,
                 search_by_rcs, search_by_rcs_fuzzy, search_by_name_country, search_by_lei,
-                _check_data_gaps, normalize_rcs, normalize_name,
+                _check_data_gaps, normalize_rcs, normalize_name, normalize_postal_code,
                 country_to_iso, _export_excel, _safe_read_excel,
             )
             from rapidfuzz import fuzz as _fuzz
@@ -500,11 +519,12 @@ class GleifApp(tk.Tk):
                 return
 
             n_total  = len(df_input)
-            col_rcs  = self.v_col_rcs.get().strip()
-            col_name = self.v_col_name.get().strip()
-            col_pays = self.v_col_pays.get().strip()
-            col_lei  = self.v_col_lei.get().strip() or None
-            col_date = self.v_col_date.get().strip() or None
+            col_rcs    = self.v_col_rcs.get().strip()
+            col_name   = self.v_col_name.get().strip()
+            col_pays   = self.v_col_pays.get().strip()
+            col_lei    = self.v_col_lei.get().strip()    or None
+            col_date   = self.v_col_date.get().strip()   or None
+            col_postal = self.v_col_postal.get().strip() or None
 
             # Vérification colonnes obligatoires
             missing = [c for c in [col_rcs, col_name, col_pays] if c not in df_input.columns]
@@ -515,9 +535,10 @@ class GleifApp(tk.Tk):
                 )
                 return
 
-            # Détermination du mode LEI / date
-            has_lei_col  = bool(col_lei)  and col_lei  in df_input.columns
-            has_date_col = bool(col_date) and col_date in df_input.columns
+            # Détermination du mode LEI / date / code postal
+            has_lei_col    = bool(col_lei)    and col_lei    in df_input.columns
+            has_date_col   = bool(col_date)   and col_date   in df_input.columns
+            has_postal_col = bool(col_postal) and col_postal in df_input.columns
             active_only  = bool(self.v_active.get())
             # En mode validation, charger tous les statuts pour trouver les LEI expirés
             _active_only_load = active_only if not has_lei_col else False
@@ -539,15 +560,17 @@ class GleifApp(tk.Tk):
             n_valid = n_discordant = n_lei_unknown = 0
 
             for idx, row in df_input.iterrows():
-                rcs_raw   = str(row[col_rcs]).strip()   if col_rcs  in df_input.columns else ""
-                name_raw  = str(row[col_name]).strip()  if col_name in df_input.columns else ""
-                pays_raw  = str(row[col_pays]).strip()  if col_pays in df_input.columns else ""
-                lei_exist = str(row[col_lei]).strip()   if has_lei_col  else ""
-                date_raw  = str(row[col_date]).strip()  if has_date_col else ""
+                rcs_raw    = str(row[col_rcs]).strip()    if col_rcs    in df_input.columns else ""
+                name_raw   = str(row[col_name]).strip()   if col_name   in df_input.columns else ""
+                pays_raw   = str(row[col_pays]).strip()   if col_pays   in df_input.columns else ""
+                lei_exist  = str(row[col_lei]).strip()    if has_lei_col    else ""
+                date_raw   = str(row[col_date]).strip()   if has_date_col   else ""
+                postal_raw = str(row[col_postal]).strip() if has_postal_col else ""
 
-                rcs_norm  = normalize_rcs(rcs_raw)
-                name_norm = normalize_name(name_raw)
-                iso       = country_to_iso(pays_raw)
+                rcs_norm      = normalize_rcs(rcs_raw)
+                name_norm     = normalize_name(name_raw)
+                iso           = country_to_iso(pays_raw)
+                postal_digits = normalize_postal_code(postal_raw) if postal_raw else ""
 
                 gleif_row   = None
                 match_type  = "Non trouve"
@@ -568,10 +591,11 @@ class GleifApp(tk.Tk):
                         else:
                             match_type = "LEI Valide"
                             n_valid += 1
-                        # Tous les écarts DQ (LEI + RCS + Nom + Date)
+                        # Tous les écarts DQ (LEI + RCS + Nom + Date + CP)
                         disc_text = _check_data_gaps(
                             gleif_row, rcs_raw, name_raw, iso,
-                            client_lei=lei_exist, client_date_raw=date_raw)
+                            client_lei=lei_exist, client_date_raw=date_raw,
+                            client_postal_raw=postal_raw)
                     else:
                         # LEI introuvable → fallback RCS/nom
                         fallback_row = None
@@ -582,7 +606,8 @@ class GleifApp(tk.Tk):
                                     rcs_norm, rcs_index, df_gleif, rcs_threshold)
                         if fallback_row is None and name_norm:
                             fallback_row, _sc = search_by_name_country(
-                                name_norm, iso, name_index, df_gleif, threshold)
+                                name_norm, iso, name_index, df_gleif, threshold,
+                                client_postal_digits=postal_digits)
 
                         if fallback_row is not None:
                             gleif_row  = fallback_row
@@ -590,7 +615,8 @@ class GleifApp(tk.Tk):
                             n_discordant += 1
                             disc_text = _check_data_gaps(
                                 gleif_row, rcs_raw, name_raw, iso,
-                                client_lei=lei_exist, client_date_raw=date_raw)
+                                client_lei=lei_exist, client_date_raw=date_raw,
+                                client_postal_raw=postal_raw)
                         else:
                             match_type = "Non trouvé (LEI invalide)"
                             n_lei_unknown += 1
@@ -630,10 +656,11 @@ class GleifApp(tk.Tk):
                                 gleif_row   = approx_r
                                 n_approx_rcs += 1
 
-                    # 2c. Fuzzy nom + pays
+                    # 2c. Fuzzy nom + pays (+ code postal)
                     if gleif_row is None and name_norm:
                         gleif_row, score = search_by_name_country(
-                            name_norm, iso, name_index, df_gleif, threshold)
+                            name_norm, iso, name_index, df_gleif, threshold,
+                            client_postal_digits=postal_digits)
                         if gleif_row is not None:
                             if active_only:
                                 es = str(gleif_row.get("entity_status", "")).upper()
@@ -642,9 +669,15 @@ class GleifApp(tk.Tk):
                                     gleif_row = None
                                     score = 0
                             if gleif_row is not None:
-                                match_type  = "Approx – Nom/Pays"
-                                match_score = score
-                                n_approx   += 1
+                                match_type = "Approx – Nom/Pays"
+                                # Indicateur code postal dans le score si fourni
+                                if postal_digits:
+                                    _gp = str(gleif_row.get("postal_code", "")).strip()
+                                    _cp_ok = bool(_gp and postal_digits in _gp)
+                                    match_score = f"Nom:{score}% / CP:{'✓' if _cp_ok else '✗'}"
+                                else:
+                                    match_score = score
+                                n_approx += 1
 
                     if gleif_row is None:
                         n_miss += 1
@@ -652,7 +685,8 @@ class GleifApp(tk.Tk):
                         # Écarts DQ pour tous les types de correspondance Mode 2
                         disc_text = _check_data_gaps(
                             gleif_row, rcs_raw, name_raw, iso,
-                            client_lei=lei_exist, client_date_raw=date_raw)
+                            client_lei=lei_exist, client_date_raw=date_raw,
+                            client_postal_raw=postal_raw)
 
                 results.append({
                     "LEI_GLEIF":                gleif_row["lei"]            if gleif_row is not None else "",
@@ -758,6 +792,7 @@ class GleifApp(tk.Tk):
             "col_pays":        self.v_col_pays.get(),
             "col_lei":         self.v_col_lei.get(),
             "col_date":        self.v_col_date.get(),
+            "col_postal":      self.v_col_postal.get(),
             "fuzzy_threshold":     int(self.v_threshold.get()),
             "rcs_fuzzy_threshold": int(self.v_rcs_threshold.get()),
             "active_only":         bool(self.v_active.get()),

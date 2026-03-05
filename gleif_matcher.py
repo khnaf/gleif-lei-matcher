@@ -26,6 +26,7 @@ Usage CLI :
 
 Colonnes GLEIF gérées automatiquement (variantes selon version Golden Copy) :
   LEI, Entity.LegalName, Entity.LegalAddress.Country,
+  Entity.LegalAddress.PostalCode,
   Entity.EntityStatus, Registration.RegistrationStatus,
   Registration.RegistrationAuthorityID, Registration.RegistrationAuthorityEntityID,
   Registration.NextRenewalDate
@@ -145,6 +146,12 @@ GLEIF_COLUMN_CANDIDATES: Dict[str, List[str]] = {
         "Registration.NextRenewalDate",
         "Registration.NextRenewal",
         "Entity.Registration.NextRenewalDate",
+    ],
+    "postal_code": [
+        "Entity.LegalAddress.PostalCode",
+        "Entity.LegalAddress.postalCode",
+        "Entity.LegalAddress.PostCode",
+        "Entity.LegalAddress.postal_code",
     ],
 }
 
@@ -276,6 +283,27 @@ def normalize_date(value) -> Optional[datetime.date]:
         except ValueError:
             continue
     return None
+
+
+def normalize_postal_code(value) -> str:
+    """
+    Extrait uniquement les chiffres d'un code postal pour la comparaison.
+
+    Stratégie :
+      • Supprime tout caractère non numérique (lettres, tirets, espaces, etc.)
+      • Exemple : "L-1338" → "1338",  "75008" → "75008",  "B-1000" → "1000"
+
+    Utilisée pour la contenance : les chiffres du code postal client doivent
+    être contenus dans le code postal GLEIF brut (qui peut avoir un préfixe
+    pays comme "L-", "B-", "D-", etc.).
+    Cette logique est analogue à celle du RCS approché.
+
+    Retourne une chaîne vide si la valeur est vide ou ne contient pas de chiffres.
+    """
+    if pd.isna(value) or str(value).strip() == "":
+        return ""
+    digits = re.sub(r"[^0-9]", "", str(value))
+    return digits
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -680,21 +708,64 @@ def search_by_name_country(
     name_index: Dict[str, Dict[str, List[int]]],
     df: pd.DataFrame,
     threshold: int = 80,
+    client_postal_digits: str = "",
 ) -> Tuple[Optional[pd.Series], int]:
+    """
+    Recherche approximative par nom + pays (et code postal optionnel).
+
+    Stratégie :
+      1. Filtre les candidats GLEIF dont le nom normalisé est ≥ threshold
+         (via fuzz.token_sort_ratio).
+      2. Si un code postal client (chiffres uniquement) est fourni :
+           • Parmi les candidats retenus, préfère ceux dont le code postal
+             GLEIF brut contient les chiffres du client (contenance).
+           • Ex: "1338" ⊆ "L-1338"  →  candidat luxembourgeois favorisé.
+           • Si aucun candidat n'a de code postal correspondant : retourne
+             le meilleur par score nom (comportement dégradé gracieux).
+      3. Sans code postal : retourne le meilleur candidat par score nom
+         (comportement original).
+
+    Retourne (row, score_nom) ou (None, 0).
+    """
     if not name_norm or not iso_country:
         return None, 0
     country_names = name_index.get(iso_country, {})
     if not country_names:
         return None, 0
-    result = process.extractOne(
+
+    if not client_postal_digits:
+        # Comportement original : meilleur score nom uniquement
+        result = process.extractOne(
+            name_norm,
+            list(country_names.keys()),
+            scorer=fuzz.token_sort_ratio,
+            score_cutoff=threshold,
+        )
+        if result is None:
+            return None, 0
+        best_name, score, _ = result
+        return df.iloc[country_names[best_name][0]], int(score)
+
+    # Avec code postal : récupérer les 10 meilleurs candidats par score nom
+    candidates = process.extract(
         name_norm,
         list(country_names.keys()),
         scorer=fuzz.token_sort_ratio,
         score_cutoff=threshold,
+        limit=10,
     )
-    if result is None:
+    if not candidates:
         return None, 0
-    best_name, score, _ = result
+
+    # Parmi les candidats, préférer celui dont le code postal correspond
+    for cand_name, name_score, _ in candidates:
+        row = df.iloc[country_names[cand_name][0]]
+        gleif_postal = str(row.get("postal_code", "")).strip()
+        if gleif_postal and client_postal_digits in gleif_postal:
+            return row, int(name_score)
+
+    # Aucun candidat avec code postal correspondant → meilleur par nom
+    best_name, score, _ = candidates[0]
     return df.iloc[country_names[best_name][0]], int(score)
 
 
@@ -709,16 +780,18 @@ def _check_data_gaps(
     client_iso: str = "",
     client_lei: str = "",
     client_date_raw: str = "",
+    client_postal_raw: str = "",
     name_threshold: int = 70,
 ) -> str:
     """
     Détecte et décrit tous les écarts entre le référentiel client et GLEIF.
 
     Contrôles effectués pour tous les types de correspondance :
-      1. LEI    — manquant côté client  OU  différent de GLEIF
-      2. RCS    — manquant côté client  OU  différent (après normalisation)
-      3. Nom    — similarité < name_threshold (seulement si les deux ont une valeur)
-      4. Date   — manquante côté client OU  différente de GLEIF (après normalisation)
+      1. LEI       — manquant côté client  OU  différent de GLEIF
+      2. RCS       — manquant côté client  OU  différent (après normalisation)
+      3. Nom       — similarité < name_threshold (seulement si les deux ont une valeur)
+      4. Date      — manquante côté client OU  différente de GLEIF (après normalisation)
+      5. Code postal — chiffres client non contenus dans le code postal GLEIF
 
     Retourne une chaîne décrivant tous les écarts, vide si aucun.
     Utilisée pour alimenter la colonne LEI_Discordance dans tous les cas
@@ -774,6 +847,20 @@ def _check_data_gaps(
             f"Date LEI: client='{date_client.strftime('%d-%m-%Y')}' "
             f"≠ GLEIF='{date_gleif.strftime('%d-%m-%Y')}'"
         )
+
+    # ── 5. Code postal ────────────────────────────────────────────────────────
+    # Règle : les chiffres du code postal client doivent être contenus dans
+    # le code postal GLEIF brut (ex: "1338" ⊆ "L-1338").
+    postal_gleif_raw   = str(gleif_row.get("postal_code", "")).strip()
+    postal_client_clean = str(client_postal_raw).strip() if client_postal_raw else ""
+    postal_client_digits = normalize_postal_code(postal_client_clean) if postal_client_clean else ""
+    if postal_client_digits and postal_gleif_raw:
+        if postal_client_digits not in postal_gleif_raw:
+            issues.append(
+                f"CP: client='{postal_client_clean}' ≠ GLEIF='{postal_gleif_raw}'"
+            )
+    elif postal_client_digits and not postal_gleif_raw:
+        pass  # GLEIF n'a pas de code postal pour cette entité → on n'alerte pas
 
     return " | ".join(issues)
 
@@ -857,6 +944,7 @@ def match_companies(
     col_pays: str = "Pays",
     col_lei: Optional[str] = None,          # colonne LEI existant (v1.2)
     col_date: Optional[str] = None,         # colonne date validité LEI (v1.4)
+    col_postal: Optional[str] = None,       # colonne code postal client (v1.5)
     fuzzy_threshold: int = 80,
     rcs_fuzzy_threshold: int = 88,
     active_only: bool = True,
@@ -868,9 +956,16 @@ def match_companies(
 
     Paramètres
     ----------
-    col_lei  : colonne LEI existants (optionnel). Si présente et non vide → mode validation.
-    col_date : colonne date validité LEI côté client (optionnel, format dd-mm-yyyy).
-               Comparée avec GLEIF renewal_date ; écart signalé dans LEI_Discordance.
+    col_lei    : colonne LEI existants (optionnel). Si présente et non vide → mode validation.
+    col_date   : colonne date validité LEI côté client (optionnel, format dd-mm-yyyy).
+                 Comparée avec GLEIF renewal_date ; écart signalé dans LEI_Discordance.
+    col_postal : colonne code postal côté client (optionnel).
+                 Utilisée pour affiner le matching nom/pays :
+                   • Les chiffres du code postal client doivent être contenus dans
+                     le code postal GLEIF (ex: "1338" ⊆ "L-1338").
+                   • Parmi plusieurs candidats nom/pays, préfère celui dont le
+                     code postal correspond.
+                   • Écart signalé dans LEI_Discordance si non conforme.
 
     Note : quand col_lei est fourni, le chargement GLEIF ignore le filtre
     active_only afin de retrouver même les LEI expirés (LAPSED / INACTIVE).
@@ -878,8 +973,8 @@ def match_companies(
 
     La colonne LEI_Discordance signale tous les écarts DQ pour chaque ligne
     ayant une correspondance (LEI manquant, RCS manquant/différent, nom
-    différent, date manquante/différente) — applicable à tous les types
-    de correspondance, pas uniquement au mode validation LEI.
+    différent, date manquante/différente, code postal différent) — applicable
+    à tous les types de correspondance, pas uniquement au mode validation LEI.
     """
     def _status(msg):
         log.info(msg)
@@ -924,20 +1019,25 @@ def match_companies(
 
     _status("Rapprochement en cours …")
 
-    has_date_col = bool(col_date) and col_date in df_input.columns
+    has_date_col   = bool(col_date)   and col_date   in df_input.columns
+    has_postal_col = bool(col_postal) and col_postal in df_input.columns
     if has_date_col:
         _status(f"  Colonne date LEI détectée : '{col_date}' — contrôle de la date activé.")
+    if has_postal_col:
+        _status(f"  Colonne code postal détectée : '{col_postal}' — affinage matching nom/pays activé.")
 
     for idx, row in df_input.iterrows():
-        rcs_raw   = str(row[col_rcs]).strip()   if col_rcs  in df_input.columns else ""
-        name_raw  = str(row[col_name]).strip()  if col_name in df_input.columns else ""
-        pays_raw  = str(row[col_pays]).strip()  if col_pays in df_input.columns else ""
-        lei_exist = str(row[col_lei]).strip()   if has_lei_col  else ""
-        date_raw  = str(row[col_date]).strip()  if has_date_col else ""
+        rcs_raw    = str(row[col_rcs]).strip()    if col_rcs    in df_input.columns else ""
+        name_raw   = str(row[col_name]).strip()   if col_name   in df_input.columns else ""
+        pays_raw   = str(row[col_pays]).strip()   if col_pays   in df_input.columns else ""
+        lei_exist  = str(row[col_lei]).strip()    if has_lei_col    else ""
+        date_raw   = str(row[col_date]).strip()   if has_date_col   else ""
+        postal_raw = str(row[col_postal]).strip() if has_postal_col else ""
 
-        rcs_norm  = normalize_rcs(rcs_raw)
-        name_norm = normalize_name(name_raw)
-        iso       = country_to_iso(pays_raw)
+        rcs_norm      = normalize_rcs(rcs_raw)
+        name_norm     = normalize_name(name_raw)
+        iso           = country_to_iso(pays_raw)
+        postal_digits = normalize_postal_code(postal_raw) if postal_raw else ""
 
         gleif_row   = None
         match_type  = "Non trouvé"
@@ -958,10 +1058,11 @@ def match_companies(
                 else:
                     match_type = "LEI Valide"
                     n_valid += 1
-                # Tous les écarts DQ pour cette ligne (LEI + RCS + Nom + Date)
+                # Tous les écarts DQ pour cette ligne (LEI + RCS + Nom + Date + CP)
                 disc_text = _check_data_gaps(
                     gleif_row, rcs_raw, name_raw, iso,
-                    client_lei=lei_exist, client_date_raw=date_raw
+                    client_lei=lei_exist, client_date_raw=date_raw,
+                    client_postal_raw=postal_raw,
                 )
 
             else:
@@ -978,7 +1079,8 @@ def match_companies(
 
                 if fallback_row is None and name_norm:
                     fallback_row, _score = search_by_name_country(
-                        name_norm, iso, name_index, df_gleif, fuzzy_threshold
+                        name_norm, iso, name_index, df_gleif, fuzzy_threshold,
+                        client_postal_digits=postal_digits,
                     )
 
                 if fallback_row is not None:
@@ -988,7 +1090,8 @@ def match_companies(
                     # Tous les écarts DQ (_check_data_gaps inclut la comparaison LEI)
                     disc_text = _check_data_gaps(
                         gleif_row, rcs_raw, name_raw, iso,
-                        client_lei=lei_exist, client_date_raw=date_raw
+                        client_lei=lei_exist, client_date_raw=date_raw,
+                        client_postal_raw=postal_raw,
                     )
                 else:
                     match_type = "Non trouvé (LEI invalide)"
@@ -1041,10 +1144,11 @@ def match_companies(
                         gleif_row  = approx_row
                         n_approx_rcs += 1
 
-            # ── 2c. Correspondance approximative nom + pays ───────────────────
+            # ── 2c. Correspondance approximative nom + pays (+ code postal) ───
             if gleif_row is None and name_norm:
                 gleif_row, score = search_by_name_country(
-                    name_norm, iso, name_index, df_gleif, fuzzy_threshold
+                    name_norm, iso, name_index, df_gleif, fuzzy_threshold,
+                    client_postal_digits=postal_digits,
                 )
                 if gleif_row is not None:
                     if active_only:
@@ -1054,9 +1158,15 @@ def match_companies(
                             gleif_row = None
                             score = 0
                     if gleif_row is not None:
-                        match_type  = "Approx – Nom/Pays"
-                        match_score = score
-                        n_approx   += 1
+                        match_type = "Approx – Nom/Pays"
+                        # Indicateur code postal dans le score si fourni
+                        if postal_digits:
+                            gleif_postal = str(gleif_row.get("postal_code", "")).strip()
+                            cp_ok = bool(gleif_postal and postal_digits in gleif_postal)
+                            match_score = f"Nom:{score}% / CP:{'✓' if cp_ok else '✗'}"
+                        else:
+                            match_score = score
+                        n_approx += 1
 
             if gleif_row is None:
                 n_miss += 1
@@ -1064,7 +1174,8 @@ def match_companies(
                 # Écarts DQ pour tous les types de correspondance Mode 2
                 disc_text = _check_data_gaps(
                     gleif_row, rcs_raw, name_raw, iso,
-                    client_lei=lei_exist, client_date_raw=date_raw
+                    client_lei=lei_exist, client_date_raw=date_raw,
+                    client_postal_raw=postal_raw,
                 )
 
         # ── Construction de la ligne de résultat ─────────────────────────────
@@ -1206,27 +1317,33 @@ def _export_excel(df: pd.DataFrame, output_path: str, threshold: int) -> None:
         ("Colonne",             "Description"),
         ("LEI_Existant",        "LEI présent dans votre base (issu du fichier d'entrée)"),
         ("LEI_GLEIF",           "LEI retourné par la base GLEIF (validé ou trouvé)"),
-        ("LEI_Discordance",     "Détail des divergences : LEI / RCS / Nom / Pays (rouge gras si renseigné)"),
+        ("LEI_Discordance",     "Détail des divergences : LEI / RCS / Nom / Date / Code Postal (rouge gras si renseigné)"),
         ("GLEIF_DateRenouvellement", "Date de prochaine échéance du LEI selon GLEIF"),
+        ("ScoreCorrespondance", "Score de correspondance : 'Nom:xx% / CP:✓' ou 'Nom:xx% / CP:✗' pour Approx Nom/Pays"),
         ("", ""),
         ("Couleur",             "Signification du type de correspondance"),
         ("Vert foncé",          "LEI validé (données cohérentes) ou correspondance exacte par RCS"),
         ("Vert clair",          "Correspondance RCS approchée — le RCS client est contenu dans le RCS GLEIF (ex: zéro de tête manquant). ScoreCorrespondance = 'RCS:xx% / Nom:yy%'"),
-        ("Jaune",               f"Correspondance approximative nom/pays (score ≥ {threshold} %)"),
-        ("Orange",              "LEI Discordant — divergence détectée (LEI erroné, RCS/nom/pays différent)"),
+        ("Jaune",               f"Correspondance approximative nom/pays (score ≥ {threshold} %). ScoreCorrespondance inclut l'indicateur code postal si fourni."),
+        ("Orange",              "LEI Discordant — divergence détectée (LEI erroné, RCS/nom/CP différent)"),
         ("Bleu clair",          "Non trouvé (LEI invalide) — introuvable même par RCS/nom"),
         ("Rouge",               "Aucune correspondance trouvée (pas de LEI dans la base d'entrée)"),
         ("", ""),
         ("Logique de détection",""),
         ("1. LEI_Existant fourni + trouvé dans GLEIF",
-         "→ comparaison RCS / Nom / Pays — Valide ou Discordant"),
+         "→ comparaison RCS / Nom / Date / Code Postal — Valide ou Discordant"),
         ("2. LEI_Existant fourni + NON trouvé dans GLEIF",
-         "→ fallback par RCS puis nom/pays pour retrouver l'entité\n"
+         "→ fallback par RCS puis nom/pays (avec code postal) pour retrouver l'entité\n"
          "   Si trouvé : LEI Discordant (avec comparaison LEI_client vs LEI_GLEIF)\n"
          "   Si introuvable : Non trouvé (LEI invalide)"),
         ("3. Pas de LEI_Existant",
          "→ RCS exact, puis RCS approché (contenance : RCS client ⊆ RCS GLEIF,\n"
-         "   ex: zéro de tête manquant), puis approximation nom+pays"),
+         "   ex: zéro de tête manquant), puis approximation nom+pays+code postal"),
+        ("", ""),
+        ("Code postal",         ""),
+        ("Règle de contenance", "Les chiffres du code postal client doivent être contenus\n"
+         "dans le code postal GLEIF brut (ex: '1338' ⊆ 'L-1338').\n"
+         "CP:✓ = correspondance, CP:✗ = écart (signalé dans LEI_Discordance)"),
     ]
     for r, (a, b) in enumerate(legend_rows, 1):
         ws_legend.cell(r, 1, a).font = Font(bold=(r == 1))
@@ -1253,6 +1370,8 @@ def _parse_args():
                    help="Colonne LEI existant dans le fichier d'entrée (ex: LEI_Existant)")
     p.add_argument("--col-date",          default=None,
                    help="Colonne date validité LEI côté client (format dd-mm-yyyy, ex: LEI_DateValidite)")
+    p.add_argument("--col-postal",        default=None,
+                   help="Colonne code postal côté client (ex: CodePostal)")
     p.add_argument("--fuzzy-threshold",     type=int, default=80,
                    help="Seuil similarité nom/pays (défaut: 80)")
     p.add_argument("--rcs-fuzzy-threshold", type=int, default=88,
@@ -1285,6 +1404,7 @@ if __name__ == "__main__":
         col_pays            = args.col_pays,
         col_lei             = args.col_lei,
         col_date            = args.col_date,
+        col_postal          = args.col_postal,
         fuzzy_threshold     = args.fuzzy_threshold,
         rcs_fuzzy_threshold = args.rcs_fuzzy_threshold,
         active_only         = args.active_only,
