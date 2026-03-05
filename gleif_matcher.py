@@ -279,6 +279,27 @@ COUNTRY_MAP: Dict[str, str] = {
     "marshall": "MH", "marshall islands": "MH",
     "micronesie": "FM", "micronésie": "FM", "micronesia": "FM",
     "palaos": "PW", "palau": "PW",
+
+    # ── Territoires, collectivités et codes spéciaux ──────────────────────────
+    # Territoires néerlandais
+    "curacao": "CW", "curaçao": "CW",
+    "sint maarten": "SX", "saint-martin neerlandais": "SX",
+    "antilles neerlandaises": "AN", "netherlands antilles": "AN",  # code obsolète (dissous 2010)
+
+    # Territoires britanniques d'outre-mer
+    "bermudes": "BM", "bermuda": "BM",
+    "ile de man": "IM", "île de man": "IM", "isle of man": "IM",
+    "anguilla": "AI",
+
+    # Collectivités françaises d'outre-mer
+    "nouvelle-caledonie": "NC", "nouvelle-calédonie": "NC", "new caledonia": "NC",
+    "polynesie francaise": "PF", "polynésie française": "PF", "french polynesia": "PF",
+
+    # Russie (oubli du dictionnaire initial)
+    "russie": "RU", "russia": "RU",
+
+    # Code GLEIF spécifique
+    "supranational": "XD",  # entités supranationales (ex: institutions européennes)
 }
 
 _ISO_PATTERN = re.compile(r"^[A-Z]{2}$")
