@@ -21,6 +21,9 @@ Colonnes de sortie supplémentaires v1.2 :
   GLEIF_DateRenouvellement — date de prochaine échéance du LEI
   LEI_Discordance          — détail des divergences détectées
 
+Colonnes de sortie supplémentaires v1.5 :
+  GLEIF_CodePostal         — code postal de l'entité selon GLEIF
+
 Usage CLI :
   python gleif_matcher.py --input societes.xlsx --gleif gleif_golden_copy.csv --output resultats.xlsx
 
@@ -1189,6 +1192,7 @@ def match_companies(
                 "GLEIF_AutoriteRegistre":   gleif_row["ra_id"],
                 "GLEIF_NumRegistre":        gleif_row["ra_entity"],
                 "GLEIF_DateRenouvellement": gleif_row["renewal_date"],
+                "GLEIF_CodePostal":         gleif_row.get("postal_code", ""),
                 "TypeCorrespondance":       match_type,
                 "ScoreCorrespondance":      match_score,
                 "LEI_Discordance":          disc_text,
@@ -1198,7 +1202,7 @@ def match_companies(
                 "LEI_GLEIF": "", "GLEIF_NomLegal": "", "GLEIF_Pays": "",
                 "GLEIF_StatutSociete": "", "GLEIF_StatutLEI": "",
                 "GLEIF_AutoriteRegistre": "", "GLEIF_NumRegistre": "",
-                "GLEIF_DateRenouvellement": "",
+                "GLEIF_DateRenouvellement": "", "GLEIF_CodePostal": "",
                 "TypeCorrespondance":  match_type,
                 "ScoreCorrespondance": "",
                 "LEI_Discordance":     "",
@@ -1259,7 +1263,7 @@ def _export_excel(df: pd.DataFrame, output_path: str, threshold: int) -> None:
         "LEI_GLEIF", "GLEIF_NomLegal", "GLEIF_Pays",
         "GLEIF_StatutSociete", "GLEIF_StatutLEI",
         "GLEIF_AutoriteRegistre", "GLEIF_NumRegistre",
-        "GLEIF_DateRenouvellement",
+        "GLEIF_DateRenouvellement", "GLEIF_CodePostal",
         "TypeCorrespondance", "ScoreCorrespondance",
         "LEI_Discordance",
     ]
@@ -1302,7 +1306,7 @@ def _export_excel(df: pd.DataFrame, output_path: str, threshold: int) -> None:
         "LEI_GLEIF": 25, "GLEIF_NomLegal": 35, "GLEIF_Pays": 10,
         "GLEIF_StatutSociete": 16, "GLEIF_StatutLEI": 14,
         "GLEIF_AutoriteRegistre": 18, "GLEIF_NumRegistre": 20,
-        "GLEIF_DateRenouvellement": 22,
+        "GLEIF_DateRenouvellement": 22, "GLEIF_CodePostal": 18,
         "TypeCorrespondance": 22, "ScoreCorrespondance": 12,
         "LEI_Discordance": 55,
     }
@@ -1319,6 +1323,7 @@ def _export_excel(df: pd.DataFrame, output_path: str, threshold: int) -> None:
         ("LEI_GLEIF",           "LEI retourné par la base GLEIF (validé ou trouvé)"),
         ("LEI_Discordance",     "Détail des divergences : LEI / RCS / Nom / Date / Code Postal (rouge gras si renseigné)"),
         ("GLEIF_DateRenouvellement", "Date de prochaine échéance du LEI selon GLEIF"),
+        ("GLEIF_CodePostal",     "Code postal de l'entité tel qu'enregistré dans GLEIF"),
         ("ScoreCorrespondance", "Score de correspondance : 'Nom:xx% / CP:✓' ou 'Nom:xx% / CP:✗' pour Approx Nom/Pays"),
         ("", ""),
         ("Couleur",             "Signification du type de correspondance"),
