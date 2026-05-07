@@ -246,11 +246,14 @@ class GleifApp(ctk.CTk):
         self.v_proxy = StringVar(value=_proxy)
 
         self._logs_visible = False
+        self._welcome_shown = False
         self._build_ui()
-        self._refresh_gleif_status()
-        self.v_gleif.trace_add("write", lambda *_: self._refresh_gleif_status())
+        # Validation initiale + écoute des changements pour rester "incassable"
+        self._refresh_data_validity()
+        self.v_gleif.trace_add("write", lambda *_: self._refresh_data_validity())
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(500, self._check_python_arch)
+        self.after(700, self._maybe_show_welcome)
 
     # ── Layout principal ────────────────────────────────────────────────────
 
@@ -603,13 +606,123 @@ class GleifApp(ctk.CTk):
             command=lambda: _browse_file(var, label, filetypes, save=save),
         ).grid(row=0, column=1)
 
-    # ── Statut base GLEIF ───────────────────────────────────────────────────
+    # ── Statut & validation base GLEIF (incassable) ─────────────────────────
 
-    def _refresh_gleif_status(self):
+    def _refresh_data_validity(self):
+        """
+        Vérifie la présence physique du fichier GLEIF référencé dans les prefs.
+        Si absent : tentative de fallback (.db → .csv frère), sinon désactive
+        le bouton Lancer et bascule en état "Aucune base".
+        Appelée au démarrage et à chaque changement de v_gleif.
+        """
+        path = (self.v_gleif.get() or "").strip()
+
+        if not path:
+            self._set_no_base_state("Aucune base sélectionnée. Cliquez sur 🔄 pour télécharger.")
+            return
+
+        if not os.path.exists(path):
+            # Cache .db disparu → tentative de fallback automatique sur le CSV
+            if path.lower().endswith(".db"):
+                parent = Path(path).parent
+                fallback = next(
+                    (p for p in (
+                        parent / "gleif_golden_copy.csv",
+                        parent / "gleif_slim.csv",
+                    ) if p.exists()),
+                    None,
+                )
+                if fallback is not None:
+                    if messagebox.askyesno(
+                        "Cache SQLite manquant",
+                        f"Le cache « {Path(path).name} » référencé dans vos préférences "
+                        f"est introuvable.\n\n"
+                        f"Un fichier source est disponible :\n   {fallback.name}\n\n"
+                        f"Voulez-vous basculer dessus (mode standard, plus lent) ?\n\n"
+                        f"Vous pourrez régénérer le cache via 🔄 « Mettre à jour »."
+                    ):
+                        self.v_gleif.set(str(fallback))
+                        return  # le trace re-déclenchera _refresh_data_validity()
+
+            # Aucun fallback possible → réinitialisation
+            self._set_no_base_state(
+                f"⚠️ Base non trouvée — Mise à jour requise\n"
+                f"   Chemin précédent : {path}"
+            )
+            # On vide la préférence pour ne pas re-prompter à chaque sortie
+            self.v_gleif.set("")
+            self._save_prefs()
+            return
+
+        # ── Fichier présent : état OK ────────────────────────────────────────
+        self._set_base_ok_state()
+
+    def _set_no_base_state(self, reason: str):
+        """Désactive le bouton Lancer et affiche un message en rouge."""
+        self.v_status.set(reason)
+        try:
+            self.lbl_status_msg.configure(text_color=C_ERR)
+        except Exception:
+            pass
+        try:
+            self.btn_run.configure(
+                state="disabled", text="⚠️  Base GLEIF requise",
+                fg_color=SG_GREY, hover_color=SG_GREY,
+            )
+        except AttributeError:
+            pass  # btn_run pas encore créé pendant l'init
+        try:
+            self.lbl_status_dot.configure(text_color=C_ERR)
+            self.lbl_status_text.configure(text="Aucune base GLEIF")
+            self.lbl_gleif_age.configure(text="Base introuvable", text_color=C_ERR)
+        except (AttributeError, Exception):
+            pass
+
+    def _set_base_ok_state(self):
+        """Réactive le bouton Lancer et affiche le statut de fraîcheur."""
         color, label = _file_age_status(self.v_gleif.get())
-        self.lbl_status_dot.configure(text_color=color)
-        self.lbl_status_text.configure(text=label)
-        self.lbl_gleif_age.configure(text=label, text_color=color)
+        try:
+            self.lbl_status_dot.configure(text_color=color)
+            self.lbl_status_text.configure(text=label)
+            self.lbl_gleif_age.configure(text=label, text_color=color)
+        except (AttributeError, Exception):
+            pass
+        try:
+            # Ne ré-active que si l'utilisateur n'a pas déclenché un run
+            if self.btn_run.cget("text") in ("⚠️  Base GLEIF requise", "▶  LANCER LE RAPPROCHEMENT"):
+                self.btn_run.configure(
+                    state="normal", text="▶  LANCER LE RAPPROCHEMENT",
+                    fg_color=SG_RED, hover_color=SG_RED_HOVER,
+                )
+            self.lbl_status_msg.configure(text_color=SG_ANTHRACITE)
+            if "Base introuvable" in self.v_status.get() or "Aucune base" in self.v_status.get() \
+                    or "Base non trouvée" in self.v_status.get():
+                self.v_status.set("Prêt — sélectionnez vos fichiers et lancez le rapprochement.")
+        except (AttributeError, Exception):
+            pass
+
+    def _maybe_show_welcome(self):
+        """
+        Affiche un message de bienvenue lors du tout premier démarrage
+        (aucune base, aucune préférence). Une seule fois par session.
+        """
+        if self._welcome_shown:
+            return
+        path = (self.v_gleif.get() or "").strip()
+        if path and os.path.exists(path):
+            return  # base OK, pas besoin de bienvenue
+
+        self._welcome_shown = True
+        messagebox.showinfo(
+            "Bienvenue dans LEI Matcher",
+            "👋  Bienvenue dans LEI Matcher — Société Générale Middle Office.\n\n"
+            "Aucune base GLEIF n'est encore configurée sur ce poste.\n\n"
+            "Pour commencer, cliquez sur le bouton 🔄  « Mettre à jour la base GLEIF » "
+            "afin de télécharger la base mondiale (≈ 450 Mo) et de générer "
+            "automatiquement le cache SQLite (mode Turbo, recommandé).\n\n"
+            "Cette opération n'est nécessaire qu'une seule fois — les mises à "
+            "jour ultérieures sont incrémentales."
+        )
 
     # ── Actions ─────────────────────────────────────────────────────────────
 
@@ -1181,21 +1294,48 @@ class UpdateDialog(ctk.CTkToplevel):
             meta  = fetch_latest_metadata(proxy=proxy)
             self._meta = meta
             gleif_path = self.v_gleif_path.get().strip()
-            dest_dir   = Path(gleif_path).parent if gleif_path else Path.cwd()
-            local_date = read_local_version(dest_dir)
 
-            if is_update_available(local_date, meta["publish_date"]):
+            # Détermination du dossier de destination — robuste si rien n'est
+            # configuré (premier démarrage)
+            if gleif_path and Path(gleif_path).exists():
+                dest_dir = Path(gleif_path).parent
+            elif gleif_path:
+                # Chemin saisi mais inexistant : on prend le dossier parent
+                # (utile si l'utilisateur vient juste de pointer vers un futur emplacement)
+                dest_dir = Path(gleif_path).parent if Path(gleif_path).parent.exists() else Path.cwd()
+            else:
+                dest_dir = Path.cwd()
+
+            # Lecture de la version locale (None si jamais téléchargé)
+            local_date = read_local_version(dest_dir)
+            local_label = local_date[:10] if local_date else "Aucune"
+
+            remote_date = meta["publish_date"][:10]
+
+            if local_date is None:
+                # Premier téléchargement
+                msg = (
+                    f"📥  Premier téléchargement\n"
+                    f"   Version locale  : Aucune\n"
+                    f"   Version distante : {remote_date}\n"
+                    f"   Taille           : {meta['size_human']}\n"
+                    f"   Entités          : {meta['record_count']:,}"
+                )
+                self.after(0, lambda: self.btn_download.configure(state="normal"))
+                self._set_status(msg, C_OK)
+            elif is_update_available(local_date, meta["publish_date"]):
                 msg = (
                     f"✓ Nouvelle version disponible\n"
-                    f"   Date    : {meta['publish_date'][:10]}\n"
-                    f"   Taille  : {meta['size_human']}\n"
-                    f"   Entités : {meta['record_count']:,}"
+                    f"   Version locale   : {local_label}\n"
+                    f"   Version distante : {remote_date}\n"
+                    f"   Taille           : {meta['size_human']}\n"
+                    f"   Entités          : {meta['record_count']:,}"
                 )
                 self.after(0, lambda: self.btn_download.configure(state="normal"))
                 self._set_status(msg, C_OK)
             else:
                 self._set_status(
-                    f"✓ Base à jour — version {meta['publish_date'][:10]} "
+                    f"✓ Base à jour — version {remote_date} "
                     f"({meta['record_count']:,} entités).",
                     C_OK,
                 )
