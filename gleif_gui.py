@@ -45,7 +45,7 @@ TEAM_CONFIG_PATH = BASE_DIR / "gleif_config.json"
 USER_PREFS_PATH  = Path.home() / ".gleif_matcher_prefs.json"
 LOGO_PATH        = BASE_DIR / "assets" / "logo_sg.png"
 
-APP_VERSION = "v2.1"
+APP_VERSION = "v2.2"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Charte Société Générale — Bento Edition
@@ -160,13 +160,15 @@ def _file_age_status(path: str) -> tuple:
     if not path or not Path(path).exists():
         return C_ERR, "Aucune base sélectionnée"
     try:
+        is_turbo = path.lower().endswith(".db")
         mtime = datetime.datetime.fromtimestamp(Path(path).stat().st_mtime)
         age = (datetime.datetime.now() - mtime).days
+        prefix = "⚡ Cache SQLite • " if is_turbo else ""
         if age < 7:
-            return C_OK, f"Base à jour ({age} j)"
+            return C_OK, f"{prefix}Base à jour ({age} j)"
         if age < 30:
-            return C_WARN, f"Base de {age} j"
-        return C_ERR, f"Base de {age} j — mise à jour recommandée"
+            return C_WARN, f"{prefix}Base de {age} j"
+        return C_ERR, f"{prefix}Base de {age} j — mise à jour recommandée"
     except Exception:
         return SG_GREY, "Statut inconnu"
 
@@ -991,6 +993,7 @@ class UpdateDialog(ctk.CTkToplevel):
         self.v_slim_progress = DoubleVar(value=0)
         self.v_status        = StringVar(value="Prêt à vérifier la version disponible.")
         self.v_prepare_slim  = BooleanVar(value=False)
+        self.v_prepare_cache = BooleanVar(value=True)  # ⚡ activé par défaut v2.2
         self._running = False
         self._meta    = None
 
@@ -1065,10 +1068,17 @@ class UpdateDialog(ctk.CTkToplevel):
             text_color="#92400E", anchor="w", justify="left",
         ).pack(anchor="w", padx=10, pady=8)
 
-        # Switch slim
+        # Switches post-téléchargement
         ctk.CTkSwitch(
             card,
-            text="Préparer la base slim après téléchargement (recommandé)",
+            text="⚡  Préparer le cache SQLite (recommandé — speedup ×10)",
+            variable=self.v_prepare_cache,
+            progress_color=SG_RED, font=ctk.CTkFont(size=11),
+        ).pack(anchor="w", padx=CARD_PADDING, pady=(0, 4))
+
+        ctk.CTkSwitch(
+            card,
+            text="Préparer la base slim CSV (legacy, optionnel)",
             variable=self.v_prepare_slim,
             progress_color=SG_RED, font=ctk.CTkFont(size=11),
         ).pack(anchor="w", padx=CARD_PADDING, pady=(0, 10))
@@ -1234,6 +1244,8 @@ class UpdateDialog(ctk.CTkToplevel):
                 self.v_progress.set(1.0),
             ])
 
+            artefacts: list = [f"CSV : {final_csv.name}"]
+
             if self.v_prepare_slim.get():
                 from gleif_matcher import prepare_slim
                 slim_path = dest_dir / "gleif_slim.csv"
@@ -1244,19 +1256,29 @@ class UpdateDialog(ctk.CTkToplevel):
                     progress_cb=self._set_slim_progress,
                     status_cb=lambda m: self._set_status(m),
                 )
+                artefacts.append(f"Slim : {slim_path.name}")
+
+            if self.v_prepare_cache.get():
+                from gleif_matcher import prepare_sqlite_cache
+                cache_path = dest_dir / "gleif_cache.db"
+                self.after(0, lambda: self.v_slim_progress.set(0))
+                self._set_status("⚡ Construction du cache SQLite (≈ 30 s)…")
+                prepare_sqlite_cache(
+                    str(final_csv), str(cache_path),
+                    active_only=True,
+                    progress_cb=self._set_slim_progress,
+                    status_cb=lambda m: self._set_status(m),
+                )
                 self.after(0, lambda: self.v_slim_progress.set(1.0))
-                self.v_gleif_path.set(str(slim_path))
-                self._set_status(
-                    f"✓ Mise à jour + slim terminés — {meta['publish_date'][:10]}\n"
-                    f"   Slim : {slim_path.name}",
-                    C_OK,
-                )
-            else:
-                self._set_status(
-                    f"✓ Mise à jour terminée — {meta['publish_date'][:10]}\n"
-                    f"   Fichier : {final_csv.name}",
-                    C_OK,
-                )
+                # Pointe automatiquement la GUI sur le cache (mode turbo)
+                self.v_gleif_path.set(str(cache_path))
+                artefacts.append(f"Cache ⚡ : {cache_path.name}")
+
+            self._set_status(
+                f"✓ Mise à jour terminée — {meta['publish_date'][:10]}\n"
+                f"   " + "  •  ".join(artefacts),
+                C_OK,
+            )
 
         except Exception as e:
             self.after(0, lambda: [
