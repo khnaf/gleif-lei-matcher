@@ -1,38 +1,27 @@
 """
 gleif_matcher.py
 ================
-Module de rapprochement LEI GLEIF pour fichiers Excel.
+Module de rapprochement LEI GLEIF — version 2.0 "Middle Office Edition".
+
+Évolutions v2.0 :
+  • Index RCS composite (RCS, Pays_ISO) : un même numéro de registre dans deux
+    pays distincts ne peut plus produire de faux positif silencieux.
+  • Colonne "Fiabilite" à 3 niveaux (OK / À vérifier / KO) et "ActionRequise"
+    explicite pour les équipes Middle Office.
+  • Export Excel restructuré par blocs thématiques (Identité / Légal / LEI /
+    Synthèse), code couleur strict ligne entière, onglet Instructions.
+  • Discordances reformulées en messages métier ("Nom différent : X vs Y")
+    sans score brut.
+  • Suppression du code mort (_check_lei_discordance).
 
 Workflow :
-  1. Si colonne LEI_Existant présente et non vide → validation du LEI existant
-       • Lookup direct par code LEI dans GLEIF
-       • Comparaison des données (RCS, nom, pays) → détection de discordance
-  2. Si LEI absent (ou colonne absente) → recherche par RCS puis fuzzy nom/pays
+  1. Si un LEI existant est fourni → mode validation (lookup direct, fallback
+     RCS+Pays / Nom+Pays si LEI introuvable dans GLEIF).
+  2. Sinon → recherche par RCS+Pays exact, RCS+Pays approché, puis Nom+Pays
+     (avec affinage par code postal si fourni).
 
-Types de correspondance :
-  LEI Valide          — LEI existant confirmé par GLEIF, données cohérentes
-  LEI Discordant      — LEI existant trouvé dans GLEIF mais données différentes
-  LEI Inconnu – GLEIF — LEI existant introuvable dans la base GLEIF
-  Exact – RCS         — correspondance exacte sur numéro de registre
-  Approx – Nom/Pays   — correspondance approximative sur nom + pays
-  Non trouvé          — aucune correspondance possible
-
-Colonnes de sortie supplémentaires v1.2 :
-  GLEIF_DateRenouvellement — date de prochaine échéance du LEI
-  LEI_Discordance          — détail des divergences détectées
-
-Colonnes de sortie supplémentaires v1.5 :
-  GLEIF_CodePostal         — code postal de l'entité selon GLEIF
-
-Usage CLI :
-  python gleif_matcher.py --input societes.xlsx --gleif gleif_golden_copy.csv --output resultats.xlsx
-
-Colonnes GLEIF gérées automatiquement (variantes selon version Golden Copy) :
-  LEI, Entity.LegalName, Entity.LegalAddress.Country,
-  Entity.LegalAddress.PostalCode,
-  Entity.EntityStatus, Registration.RegistrationStatus,
-  Registration.RegistrationAuthorityID, Registration.RegistrationAuthorityEntityID,
-  Registration.NextRenewalDate
+Toute correspondance qui n'est pas "Exact RCS + Pays" est marquée
+"À vérifier" et générera un avertissement dans la GUI.
 """
 
 import argparse
@@ -60,7 +49,6 @@ log = logging.getLogger(__name__)
 # Mapping pays → ISO 3166-1 alpha-2
 # ─────────────────────────────────────────────────────────────────────────────
 COUNTRY_MAP: Dict[str, str] = {
-    # ── Europe ────────────────────────────────────────────────────────────────
     "france": "FR",
     "allemagne": "DE", "germany": "DE",
     "italie": "IT", "italy": "IT",
@@ -115,8 +103,7 @@ COUNTRY_MAP: Dict[str, str] = {
     "georgie": "GE", "géorgie": "GE", "georgia": "GE",
     "armenie": "AM", "arménie": "AM", "armenia": "AM",
     "azerbaidjan": "AZ", "azerbaïdjan": "AZ", "azerbaijan": "AZ",
-
-    # ── Amériques ─────────────────────────────────────────────────────────────
+    "russie": "RU", "russia": "RU",
     "canada": "CA",
     "mexique": "MX", "mexico": "MX",
     "bresil": "BR", "brésil": "BR", "brazil": "BR",
@@ -127,8 +114,7 @@ COUNTRY_MAP: Dict[str, str] = {
     "venezuela": "VE",
     "equateur": "EC", "équateur": "EC", "ecuador": "EC",
     "bolivie": "BO", "bolivia": "BO",
-    "paraguay": "PY",
-    "uruguay": "UY",
+    "paraguay": "PY", "uruguay": "UY",
     "guyane": "GY", "guyana": "GY",
     "suriname": "SR",
     "cuba": "CU",
@@ -138,44 +124,27 @@ COUNTRY_MAP: Dict[str, str] = {
     "jamaique": "JM", "jamaïque": "JM", "jamaica": "JM",
     "trinite-et-tobago": "TT", "trinidad and tobago": "TT", "trinidad": "TT",
     "barbade": "BB", "barbados": "BB",
-    "bahamas": "BS",
-    "belize": "BZ",
-    "guatemala": "GT",
-    "honduras": "HN",
+    "bahamas": "BS", "belize": "BZ",
+    "guatemala": "GT", "honduras": "HN",
     "salvador": "SV", "el salvador": "SV",
-    "nicaragua": "NI",
-    "costa rica": "CR",
+    "nicaragua": "NI", "costa rica": "CR",
     "panama": "PA", "panamá": "PA",
     "porto rico": "PR", "puerto rico": "PR",
-    "sainte-lucie": "LC", "saint lucia": "LC",
-    "saint-vincent": "VC", "saint vincent and the grenadines": "VC",
-    "grenade": "GD", "grenada": "GD",
-    "antigua-et-barbuda": "AG", "antigua and barbuda": "AG",
-    "saint-kitts-et-nevis": "KN", "saint kitts and nevis": "KN",
-    "dominique": "DM", "dominica": "DM",
-    "guyana": "GY",
-
-    # ── Asie ──────────────────────────────────────────────────────────────────
     "chine": "CN", "china": "CN",
     "japon": "JP", "japan": "JP",
     "coree du sud": "KR", "corée du sud": "KR", "south korea": "KR", "korea": "KR",
     "coree du nord": "KP", "corée du nord": "KP", "north korea": "KP",
     "inde": "IN", "india": "IN",
-    "pakistan": "PK",
-    "bangladesh": "BD",
-    "sri lanka": "LK",
-    "nepal": "NP", "népal": "NP",
-    "bhoutan": "BT", "bhutan": "BT",
-    "afghanistan": "AF",
-    "iran": "IR",
+    "pakistan": "PK", "bangladesh": "BD", "sri lanka": "LK",
+    "nepal": "NP", "népal": "NP", "bhoutan": "BT", "bhutan": "BT",
+    "afghanistan": "AF", "iran": "IR",
     "irak": "IQ", "iraq": "IQ",
     "syrie": "SY", "syria": "SY",
     "liban": "LB", "lebanon": "LB",
     "israel": "IL", "israël": "IL",
     "jordanie": "JO", "jordan": "JO",
     "arabie saoudite": "SA", "saudi arabia": "SA",
-    "emirats arabes unis": "AE", "uae": "AE",
-    "united arab emirates": "AE",
+    "emirats arabes unis": "AE", "uae": "AE", "united arab emirates": "AE",
     "qatar": "QA",
     "koweit": "KW", "koweït": "KW", "kuwait": "KW",
     "bahrein": "BH", "bahreïn": "BH", "bahrain": "BH",
@@ -196,15 +165,11 @@ COUNTRY_MAP: Dict[str, str] = {
     "malaisie": "MY", "malaysia": "MY",
     "singapour": "SG", "singapore": "SG",
     "indonesie": "ID", "indonésie": "ID", "indonesia": "ID",
-    "philippines": "PH",
-    "taiwan": "TW",
-    "hong kong": "HK",
-    "macao": "MO", "macau": "MO",
+    "philippines": "PH", "taiwan": "TW",
+    "hong kong": "HK", "macao": "MO", "macau": "MO",
     "brunei": "BN",
     "timor oriental": "TL", "timor-leste": "TL", "east timor": "TL",
     "maldives": "MV",
-
-    # ── Afrique ───────────────────────────────────────────────────────────────
     "maroc": "MA", "morocco": "MA",
     "algerie": "DZ", "algérie": "DZ", "algeria": "DZ",
     "tunisie": "TN", "tunisia": "TN",
@@ -219,20 +184,16 @@ COUNTRY_MAP: Dict[str, str] = {
     "kenya": "KE",
     "tanzanie": "TZ", "tanzania": "TZ",
     "ouganda": "UG", "uganda": "UG",
-    "rwanda": "RW",
-    "burundi": "BI",
-    "mozambique": "MZ",
-    "zimbabwe": "ZW",
+    "rwanda": "RW", "burundi": "BI",
+    "mozambique": "MZ", "zimbabwe": "ZW",
     "zambie": "ZM", "zambia": "ZM",
-    "malawi": "MW",
-    "madagascar": "MG",
+    "malawi": "MW", "madagascar": "MG",
     "ile maurice": "MU", "maurice": "MU", "mauritius": "MU",
     "comores": "KM", "comoros": "KM",
     "seychelles": "SC",
     "afrique du sud": "ZA", "south africa": "ZA",
     "namibie": "NA", "namibia": "NA",
-    "botswana": "BW",
-    "lesotho": "LS",
+    "botswana": "BW", "lesotho": "LS",
     "swaziland": "SZ", "eswatini": "SZ",
     "angola": "AO",
     "congo": "CG", "republique du congo": "CG", "republic of the congo": "CG",
@@ -242,18 +203,15 @@ COUNTRY_MAP: Dict[str, str] = {
     "cameroun": "CM", "cameroon": "CM",
     "guinee equatoriale": "GQ", "equatorial guinea": "GQ",
     "sao tome-et-principe": "ST", "sao tome and principe": "ST",
-    "nigeria": "NG",
-    "ghana": "GH",
+    "nigeria": "NG", "ghana": "GH",
     "cote d'ivoire": "CI", "cote divoire": "CI", "ivory coast": "CI",
-    "liberia": "LR",
-    "sierra leone": "SL",
+    "liberia": "LR", "sierra leone": "SL",
     "guinee": "GN", "guinée": "GN", "guinea": "GN",
     "guinee-bissau": "GW", "guinea-bissau": "GW",
     "senegal": "SN", "sénégal": "SN",
     "gambie": "GM", "gambia": "GM",
     "mauritanie": "MR", "mauritania": "MR",
-    "mali": "ML",
-    "burkina faso": "BF",
+    "mali": "ML", "burkina faso": "BF",
     "niger": "NE",
     "tchad": "TD", "chad": "TD",
     "togo": "TG",
@@ -261,45 +219,26 @@ COUNTRY_MAP: Dict[str, str] = {
     "cap-vert": "CV", "cape verde": "CV", "cabo verde": "CV",
     "centrafrique": "CF", "republique centrafricaine": "CF",
     "central african republic": "CF",
-    "mozambique": "MZ",
-    "libye": "LY",
-
-    # ── Océanie ───────────────────────────────────────────────────────────────
     "australie": "AU", "australia": "AU",
     "nouvelle-zelande": "NZ", "nouvelle-zélande": "NZ", "new zealand": "NZ",
     "papouasie-nouvelle-guinee": "PG", "papua new guinea": "PG",
     "fidji": "FJ", "fiji": "FJ",
     "vanuatu": "VU",
     "salomon": "SB", "solomon islands": "SB",
-    "samoa": "WS",
-    "tonga": "TO",
-    "kiribati": "KI",
-    "tuvalu": "TV",
-    "nauru": "NR",
+    "samoa": "WS", "tonga": "TO",
+    "kiribati": "KI", "tuvalu": "TV", "nauru": "NR",
     "marshall": "MH", "marshall islands": "MH",
     "micronesie": "FM", "micronésie": "FM", "micronesia": "FM",
     "palaos": "PW", "palau": "PW",
-
-    # ── Territoires, collectivités et codes spéciaux ──────────────────────────
-    # Territoires néerlandais
     "curacao": "CW", "curaçao": "CW",
     "sint maarten": "SX", "saint-martin neerlandais": "SX",
-    "antilles neerlandaises": "AN", "netherlands antilles": "AN",  # code obsolète (dissous 2010)
-
-    # Territoires britanniques d'outre-mer
+    "antilles neerlandaises": "AN", "netherlands antilles": "AN",
     "bermudes": "BM", "bermuda": "BM",
     "ile de man": "IM", "île de man": "IM", "isle of man": "IM",
     "anguilla": "AI",
-
-    # Collectivités françaises d'outre-mer
     "nouvelle-caledonie": "NC", "nouvelle-calédonie": "NC", "new caledonia": "NC",
     "polynesie francaise": "PF", "polynésie française": "PF", "french polynesia": "PF",
-
-    # Russie (oubli du dictionnaire initial)
-    "russie": "RU", "russia": "RU",
-
-    # Code GLEIF spécifique
-    "supranational": "XD",  # entités supranationales (ex: institutions européennes)
+    "supranational": "XD",
 }
 
 _ISO_PATTERN = re.compile(r"^[A-Z]{2}$")
@@ -316,29 +255,14 @@ _LEGAL_FORMS_RE = re.compile(
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Schéma GLEIF — candidats par ordre de priorité pour chaque colonne logique
-# Gère les variantes de nommage entre versions du Golden Copy
+# Schéma GLEIF
 # ─────────────────────────────────────────────────────────────────────────────
 GLEIF_COLUMN_CANDIDATES: Dict[str, List[str]] = {
-    "lei": [
-        "LEI",
-    ],
-    "name": [
-        "Entity.LegalName",
-        "Entity.LegalName.name",
-    ],
-    "country": [
-        "Entity.LegalAddress.Country",
-        "Entity.LegalAddress.country",
-    ],
-    "entity_status": [
-        "Entity.EntityStatus",
-        "Entity.Status",
-    ],
-    "lei_status": [
-        "Registration.RegistrationStatus",
-        "Registration.Status",
-    ],
+    "lei":           ["LEI"],
+    "name":          ["Entity.LegalName", "Entity.LegalName.name"],
+    "country":       ["Entity.LegalAddress.Country", "Entity.LegalAddress.country"],
+    "entity_status": ["Entity.EntityStatus", "Entity.Status"],
+    "lei_status":    ["Registration.RegistrationStatus", "Registration.Status"],
     "ra_id": [
         "Registration.RegistrationAuthorityID",
         "Entity.RegistrationAuthority.RegistrationAuthorityID",
@@ -364,29 +288,21 @@ GLEIF_COLUMN_CANDIDATES: Dict[str, List[str]] = {
     ],
 }
 
-# Noms standardisés dans le DataFrame interne et dans le slim CSV
-SLIM_COLUMNS = list(GLEIF_COLUMN_CANDIDATES.keys())  # ordre stable
-
-# Taille des chunks pour la lecture du CSV complet (~450 Mo)
+SLIM_COLUMNS = list(GLEIF_COLUMN_CANDIDATES.keys())
 GLEIF_CHUNK_SIZE = 100_000
+
+# Seuil DQ pour le calcul de la discordance "nom" (plus exigeant que le seuil de matching)
+NAME_DQ_THRESHOLD = 85
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Détection du schéma réel du fichier GLEIF
+# Détection schéma GLEIF
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _detect_gleif_columns(available_cols: List[str]) -> Tuple[Dict[str, str], List[str]]:
-    """
-    Mappe les colonnes logiques vers les noms réels présents dans le fichier.
-
-    Retourne :
-      col_map  : {logical_name → actual_column_name}   pour les colonnes trouvées
-      missing  : liste des colonnes logiques non trouvées (non bloquant)
-    """
     available_set = set(available_cols)
     col_map: Dict[str, str] = {}
     missing: List[str] = []
-
     for logical, candidates in GLEIF_COLUMN_CANDIDATES.items():
         found = next((c for c in candidates if c in available_set), None)
         if found:
@@ -395,13 +311,11 @@ def _detect_gleif_columns(available_cols: List[str]) -> Tuple[Dict[str, str], Li
             missing.append(logical)
             log.warning(
                 f"Colonne GLEIF non trouvée : '{logical}' "
-                f"(candidats essayés : {candidates}). Colonne laissée vide."
+                f"(candidats : {candidates}). Colonne laissée vide."
             )
-
-    log.info(f"Mapping colonnes GLEIF : { {k: v for k, v in col_map.items()} }")
+    log.info(f"Mapping colonnes GLEIF : {col_map}")
     if missing:
-        log.warning(f"Colonnes absentes (seront vides) : {missing}")
-
+        log.warning(f"Colonnes absentes (vides) : {missing}")
     return col_map, missing
 
 
@@ -410,34 +324,15 @@ def _detect_gleif_columns(available_cols: List[str]) -> Tuple[Dict[str, str], Li
 # ─────────────────────────────────────────────────────────────────────────────
 
 def normalize_rcs(value) -> str:
-    """
-    Normalise un numéro de registre pour la comparaison.
-
-    Étapes :
-      1. Unicode NFKC : chiffres pleine largeur (０-９), arabes-indics (٠-٩), etc.
-      2. Conversion des chiffres Unicode non-ASCII restants
-      3. Suppression du préfixe "RCS Ville" (ex : "RCS Paris 552 032 534")
-      4. Suppression de tout caractère non alphanumérique
-
-    Note : les zéros de tête sont intentionnellement conservés.
-    Un RCS "1513210151" (base client) vs "01513210151" (GLEIF) n'est pas
-    normalisé à l'identique — cette différence est détectée par search_by_rcs_fuzzy
-    et signalée comme "Approx – RCS" pour que le Middle Office puisse corriger
-    son référentiel source.
-    """
     if pd.isna(value) or str(value).strip() == "":
         return ""
     raw = str(value)
-    # Étape 1 : normalisation Unicode NFKC
     raw = unicodedata.normalize("NFKC", raw).upper()
-    # Étape 2 : chiffres Unicode non-ASCII restants → ASCII
     raw = "".join(
         str(unicodedata.digit(c, -1)) if unicodedata.category(c) == "Nd" and not c.isascii() else c
         for c in raw
     )
-    # Étape 3 : suppression du préfixe "RCS Ville"
     raw = re.sub(r"^RCS\s+[A-ZÉÈÀÂÊÎÔÙÛÇ\s]+\s+", "", raw).strip()
-    # Étape 4 : garder uniquement les caractères alphanumériques ASCII
     return re.sub(r"[^0-9A-Z]", "", raw)
 
 
@@ -467,25 +362,13 @@ def country_to_iso(value) -> str:
 
 
 def normalize_date(value) -> Optional[datetime.date]:
-    """
-    Normalise une date vers datetime.date quelle que soit sa représentation.
-
-    Formats gérés :
-      • GLEIF ISO 8601 : "2025-12-31T00:00:00Z" / "2025-12-31T00:00:00+00:00"
-      • Date ISO courte : "2025-12-31"
-      • Format client    : "31-12-2025" / "31/12/2025" / "31.12.2025"
-
-    Retourne None si la valeur est vide, nulle ou non parsable.
-    """
     if pd.isna(value) or str(value).strip() in ("", "nan", "NaT", "None"):
         return None
     raw = str(value).strip()
-    # Tronquer au format yyyy-mm-dd si la date contient une partie heure
     if "T" in raw:
         raw = raw.split("T")[0]
     elif len(raw) > 10 and raw[10] in (" ", "+"):
         raw = raw[:10]
-    # Essai des formats courants (ISO d'abord, puis formats client)
     for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%d.%m.%Y", "%Y/%m/%d"):
         try:
             return datetime.datetime.strptime(raw, fmt).date()
@@ -495,62 +378,31 @@ def normalize_date(value) -> Optional[datetime.date]:
 
 
 def normalize_postal_code(value) -> str:
-    """
-    Extrait uniquement les chiffres d'un code postal pour la comparaison.
-
-    Stratégie :
-      • Supprime tout caractère non numérique (lettres, tirets, espaces, etc.)
-      • Exemple : "L-1338" → "1338",  "75008" → "75008",  "B-1000" → "1000"
-
-    Utilisée pour la contenance : les chiffres du code postal client doivent
-    être contenus dans le code postal GLEIF brut (qui peut avoir un préfixe
-    pays comme "L-", "B-", "D-", etc.).
-    Cette logique est analogue à celle du RCS approché.
-
-    Retourne une chaîne vide si la valeur est vide ou ne contient pas de chiffres.
-    """
     if pd.isna(value) or str(value).strip() == "":
         return ""
-    digits = re.sub(r"[^0-9]", "", str(value))
-    return digits
+    return re.sub(r"[^0-9]", "", str(value))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Lecture sécurisée d'un fichier Excel (gestion OneDrive Entreprise)
+# Lecture Excel sécurisée (OneDrive)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _safe_read_excel(path: str) -> pd.DataFrame:
-    """
-    Lit un fichier Excel en gérant les erreurs de permission OneDrive.
-
-    Si PermissionError détecté (fichier cloud-only ou verrouillé par OneDrive),
-    copie le fichier dans %TEMP%\\gleif_match\\ avant lecture.
-    """
     p = Path(path)
     try:
         return pd.read_excel(path, dtype=str)
     except PermissionError:
-        is_onedrive = "onedrive" in str(p).lower()
-        if is_onedrive:
-            log.warning(
-                "Fichier OneDrive Entreprise inaccessible (cloud-only ou verrouillé). "
-                "Copie temporaire en cours..."
-            )
-        else:
-            log.warning(f"Permission refusée sur '{p.name}'. Tentative via copie temp...")
-
+        log.warning(f"Permission refusée sur '{p.name}'. Copie temporaire en cours…")
         tmp_dir = Path(tempfile.gettempdir()) / "gleif_match"
         tmp_dir.mkdir(parents=True, exist_ok=True)
         tmp_path = tmp_dir / p.name
         shutil.copy2(path, str(tmp_path))
         log.info(f"Lecture depuis copie temporaire : {tmp_path}")
         return pd.read_excel(str(tmp_path), dtype=str)
-    except Exception:
-        raise
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Chargement GLEIF — lecture en chunks pour gérer les ~450 Mo
+# Chargement GLEIF (CSV par chunks)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_gleif(
@@ -559,22 +411,6 @@ def load_gleif(
     progress_cb: Optional[Callable[[int, int], None]] = None,
     status_cb: Optional[Callable[[str], None]] = None,
 ) -> pd.DataFrame:
-    """
-    Charge le fichier Golden Copy GLEIF (CSV ou JSON) en mémoire minimale.
-
-    Stratégie CSV :
-      1. Lecture de l'en-tête uniquement pour détecter le schéma réel
-      2. Construction de la liste usecols avec les colonnes effectivement présentes
-      3. Lecture en chunks (GLEIF_CHUNK_SIZE lignes) avec filtrage à la volée
-      4. Concaténation des chunks filtrés → DataFrame final compact
-
-    Paramètres
-    ----------
-    gleif_path  : chemin vers le fichier GLEIF (CSV ou JSON)
-    active_only : filtre Entity=ACTIVE et LEI=ISSUED
-    progress_cb : callback(chunks_lus, total_estimé)  [optionnel]
-    status_cb   : callback(message_texte)             [optionnel]
-    """
     def _status(msg: str):
         log.info(msg)
         if status_cb:
@@ -584,7 +420,6 @@ def load_gleif(
     suffix = path.suffix.lower()
     _status(f"Chargement GLEIF : {path.name} …")
 
-    # ── JSON ──────────────────────────────────────────────────────────────────
     if suffix == ".json":
         _status("Format JSON — lecture complète en mémoire…")
         raw = pd.read_json(gleif_path, dtype=str)
@@ -592,89 +427,57 @@ def load_gleif(
             raw = pd.json_normalize(raw.to_dict(orient="records"))
         return _finalize_gleif_df(raw, active_only)
 
-    # ── CSV — lecture en chunks ───────────────────────────────────────────────
-    # Étape 1 : détecter le schéma en lisant uniquement la première ligne
     header_df = pd.read_csv(gleif_path, nrows=0, dtype=str, low_memory=False)
     available_cols = list(header_df.columns)
-
-    # Détection du format : slim (colonnes logiques) vs Golden Copy complet
-    # Le slim CSV a des headers comme "lei", "name", "country"…
-    # Le Golden Copy a des headers comme "Entity.LegalName", "Registration.RegistrationStatus"…
     _slim_markers = {"lei", "name", "country", "entity_status", "lei_status"}
     is_slim_format = _slim_markers.issubset(set(available_cols))
 
     if is_slim_format:
-        # ── Format slim : colonnes déjà normalisées, pas de renommage ────────
-        _status("Format slim détecté — chargement direct des colonnes logiques…")
-        # Avertissement : la slim ne contient que ACTIVE+ISSUED ; en mode validation
-        # (active_only=False), les entités LAPSED sont absentes → fallback limité.
+        _status("Format slim détecté — chargement direct.")
         if not active_only:
-            _warn = (
-                "⚠  Base slim + mode validation LEI : la slim ne contient que "
-                "les entités ACTIVE+ISSUED. Les entités LAPSED/INACTIVE absentes "
-                "de la slim ne seront pas retrouvées par le fallback RCS/nom. "
-                "Pour une couverture complète des LEI expirés, utilisez le "
-                "Golden Copy complet ou régénérez la slim sans filtre actif."
+            log.warning(
+                "Base slim + mode validation : entités LAPSED absentes — "
+                "fallback RCS/nom limité aux LEI ACTIFS."
             )
-            log.warning(_warn)
             if status_cb:
-                status_cb("⚠ Base slim : entités LAPSED absentes — validation LEI partielle")
+                status_cb("⚠ Base slim : LEI expirés non couverts.")
         usecols = [col for col in SLIM_COLUMNS if col in available_cols]
-        # Ajouter les colonnes slim manquantes (ex: renewal_date absent d'un ancien slim)
-        _missing_slim = [c for c in SLIM_COLUMNS if c not in available_cols]
-        if _missing_slim:
-            log.warning(f"Colonnes absentes du slim (seront vides) : {_missing_slim}")
-        col_map = None  # pas de renommage nécessaire
+        col_map = None
     else:
-        # ── Format Golden Copy complet : détecter les noms GLEIF réels ───────
-        col_map, _missing = _detect_gleif_columns(available_cols)
+        col_map, _ = _detect_gleif_columns(available_cols)
         usecols = list(set(col_map.values()))
 
     _status(f"Colonnes retenues : {len(usecols)} / {len(available_cols)} — lecture par chunks…")
 
-    # Estimation de la taille totale pour la progression
     try:
         file_size = path.stat().st_size
         estimated_total_chunks = max(1, file_size // (200 * GLEIF_CHUNK_SIZE))
     except Exception:
-        estimated_total_chunks = 200  # fallback
+        estimated_total_chunks = 200
 
-    # Étape 2 : lecture chunked
     chunks: List[pd.DataFrame] = []
     chunks_read = 0
-
     reader = pd.read_csv(
-        gleif_path,
-        usecols=usecols,
-        dtype=str,
-        low_memory=False,
-        chunksize=GLEIF_CHUNK_SIZE,
-        on_bad_lines="skip",
+        gleif_path, usecols=usecols, dtype=str, low_memory=False,
+        chunksize=GLEIF_CHUNK_SIZE, on_bad_lines="skip",
     )
 
     for chunk in reader:
         if not is_slim_format and col_map:
-            # Golden Copy : renommer les colonnes GLEIF → noms logiques
             rename_map = {v: k for k, v in col_map.items()}
             chunk = chunk.rename(columns=rename_map)
-
-        # Ajouter les colonnes logiques manquantes (vides)
         for logical in SLIM_COLUMNS:
             if logical not in chunk.columns:
                 chunk[logical] = ""
-
         chunk = chunk[SLIM_COLUMNS].fillna("")
-
         if active_only:
             mask = (
                 (chunk["entity_status"].str.upper() == "ACTIVE") &
                 (chunk["lei_status"].str.upper() == "ISSUED")
             )
             chunk = chunk[mask]
-
         if not chunk.empty:
             chunks.append(chunk)
-
         chunks_read += 1
         if progress_cb:
             progress_cb(chunks_read, estimated_total_chunks)
@@ -684,16 +487,14 @@ def load_gleif(
         return pd.DataFrame(columns=SLIM_COLUMNS)
 
     df = pd.concat(chunks, ignore_index=True)
-
     _status(
-        f"  Chargement terminé : {len(df):,} entités retenues "
-        f"({'filtre ACTIVE+ISSUED' if active_only else 'tous statuts'})"
+        f"  Chargement terminé : {len(df):,} entités "
+        f"({'ACTIVE+ISSUED' if active_only else 'tous statuts'})"
     )
     return df
 
 
 def _finalize_gleif_df(raw: pd.DataFrame, active_only: bool) -> pd.DataFrame:
-    """Post-traitement commun pour le JSON et les petits CSV."""
     col_map, _ = _detect_gleif_columns(list(raw.columns))
     rename_map = {v: k for k, v in col_map.items()}
     df = raw.rename(columns=rename_map)
@@ -711,7 +512,7 @@ def _finalize_gleif_df(raw: pd.DataFrame, active_only: bool) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Préparation d'une base SLIM (CSV léger, colonnes essentielles, filtrée)
+# Préparation base slim
 # ─────────────────────────────────────────────────────────────────────────────
 
 def prepare_slim(
@@ -721,22 +522,12 @@ def prepare_slim(
     progress_cb: Optional[Callable[[int, int], None]] = None,
     status_cb: Optional[Callable[[str], None]] = None,
 ) -> int:
-    """
-    Génère un CSV allégé depuis le Golden Copy complet.
-
-    Le slim CSV ne contient que les colonnes utiles (incluant la date de
-    renouvellement) et optionnellement uniquement les entités ACTIVE + ISSUED.
-
-    Retourne le nombre de lignes écrites.
-    """
     def _status(msg: str):
         log.info(msg)
         if status_cb:
             status_cb(msg)
 
-    path_in = Path(input_csv)
-    path_out = Path(output_csv)
-
+    path_in, path_out = Path(input_csv), Path(output_csv)
     _status(f"Préparation base slim : {path_in.name} → {path_out.name} …")
 
     header_df = pd.read_csv(str(path_in), nrows=0, dtype=str, low_memory=False)
@@ -750,12 +541,8 @@ def prepare_slim(
         estimated_chunks = 200
 
     reader = pd.read_csv(
-        str(path_in),
-        usecols=usecols,
-        dtype=str,
-        low_memory=False,
-        chunksize=GLEIF_CHUNK_SIZE,
-        on_bad_lines="skip",
+        str(path_in), usecols=usecols, dtype=str, low_memory=False,
+        chunksize=GLEIF_CHUNK_SIZE, on_bad_lines="skip",
     )
 
     total_written = 0
@@ -769,25 +556,19 @@ def prepare_slim(
             if logical not in chunk.columns:
                 chunk[logical] = ""
         chunk = chunk[SLIM_COLUMNS].fillna("")
-
         if active_only:
             mask = (
                 (chunk["entity_status"].str.upper() == "ACTIVE") &
                 (chunk["lei_status"].str.upper() == "ISSUED")
             )
             chunk = chunk[mask]
-
         if not chunk.empty:
             chunk.to_csv(
-                str(path_out),
-                mode="w" if first_chunk else "a",
-                header=first_chunk,
-                index=False,
-                encoding="utf-8",
+                str(path_out), mode="w" if first_chunk else "a",
+                header=first_chunk, index=False, encoding="utf-8",
             )
             total_written += len(chunk)
             first_chunk = False
-
         chunks_read += 1
         if progress_cb:
             progress_cb(chunks_read, estimated_chunks)
@@ -797,28 +578,40 @@ def prepare_slim(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Index de recherche
+# Index — RCS composite (rcs_norm, iso_pays)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_indices(
     df: pd.DataFrame,
-) -> Tuple[Dict[str, List[int]], Dict[str, Dict[str, List[int]]], Dict[str, int]]:
+) -> Tuple[
+    Dict[Tuple[str, str], List[int]],   # rcs_index : (rcs_norm, iso) → indices
+    Dict[str, Dict[str, List[int]]],     # name_index : iso → nom → indices
+    Dict[str, int],                      # lei_index : LEI → indice
+    Dict[str, List[int]],                # rcs_country_agnostic : rcs_norm → indices (pour audit)
+]:
     """
-    Construit trois index de recherche sur le DataFrame GLEIF :
-      rcs_index  : {rcs_normalisé → [indices de lignes]}
-      name_index : {pays_iso → {nom_normalisé → [indices de lignes]}}
-      lei_index  : {code_LEI_upper → indice de ligne}  ← nouveau v1.2
+    Construit les index de recherche.
+
+    rcs_index est désormais COMPOSITE (rcs_norm, iso_pays). Un même numéro de
+    registre dans deux pays différents n'est plus collisionnant — c'est le
+    correctif fiabilité v2.0 demandé par le Middle Office SG.
+
+    rcs_country_agnostic est conservé en parallèle pour permettre une recherche
+    de fallback explicite quand le pays client est absent (avec flag de
+    fiabilité dégradée à l'appelant).
     """
     log.info("Construction des index …")
-    rcs_index: Dict[str, List[int]] = {}
+    rcs_index: Dict[Tuple[str, str], List[int]] = {}
+    rcs_country_agnostic: Dict[str, List[int]] = {}
     lei_index: Dict[str, int] = {}
 
-    for i, (lei, ra_entity) in enumerate(zip(df["lei"], df["ra_entity"])):
-        # Index RCS
+    for i, (lei, ra_entity, country) in enumerate(zip(df["lei"], df["ra_entity"], df["country"])):
         key_rcs = normalize_rcs(ra_entity)
+        iso = str(country).strip().upper()
         if key_rcs:
-            rcs_index.setdefault(key_rcs, []).append(i)
-        # Index LEI (lookup direct O(1))
+            rcs_country_agnostic.setdefault(key_rcs, []).append(i)
+            if iso:
+                rcs_index.setdefault((key_rcs, iso), []).append(i)
         key_lei = str(lei).strip().upper()
         if key_lei:
             lei_index[key_lei] = i
@@ -831,71 +624,93 @@ def build_indices(
             name_index.setdefault(c, {}).setdefault(n, []).append(i)
 
     log.info(
-        f"  Index RCS : {len(rcs_index):,} entrées | "
-        f"Index LEI : {len(lei_index):,} entrées | "
-        f"Index noms : {sum(len(v) for v in name_index.values()):,} entrées"
+        f"  Index RCS+Pays : {len(rcs_index):,}  | "
+        f"Index LEI : {len(lei_index):,}  | "
+        f"Index Nom : {sum(len(v) for v in name_index.values()):,}"
     )
-    return rcs_index, name_index, lei_index
+    return rcs_index, name_index, lei_index, rcs_country_agnostic
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Recherches
+# ─────────────────────────────────────────────────────────────────────────────
 
 def search_by_rcs(
     rcs_norm: str,
-    rcs_index: Dict[str, List[int]],
+    iso_country: str,
+    rcs_index: Dict[Tuple[str, str], List[int]],
     df: pd.DataFrame,
-) -> Optional[pd.Series]:
+    rcs_country_agnostic: Optional[Dict[str, List[int]]] = None,
+) -> Tuple[Optional[pd.Series], str]:
+    """
+    Recherche RCS exacte avec contrôle pays.
+
+    Retourne (row, country_status) où country_status ∈ {"strict", "agnostic", "none"} :
+      • "strict"    : match (RCS, Pays) exact dans l'index composite — fiable
+      • "agnostic"  : pays client absent → fallback sur RCS seul (À vérifier)
+      • "none"      : aucun match
+    """
     if not rcs_norm:
-        return None
-    indices = rcs_index.get(rcs_norm)
-    return df.iloc[indices[0]] if indices else None
+        return None, "none"
+    if iso_country:
+        idxs = rcs_index.get((rcs_norm, iso_country))
+        if idxs:
+            return df.iloc[idxs[0]], "strict"
+        return None, "none"
+    # Pays client absent : fallback country-agnostic (signalé par le caller)
+    if rcs_country_agnostic is not None:
+        idxs = rcs_country_agnostic.get(rcs_norm)
+        if idxs:
+            return df.iloc[idxs[0]], "agnostic"
+    return None, "none"
 
 
 def search_by_rcs_fuzzy(
     rcs_norm: str,
-    rcs_index: Dict[str, List[int]],
+    iso_country: str,
+    rcs_index: Dict[Tuple[str, str], List[int]],
     df: pd.DataFrame,
     threshold: int = 88,
-) -> Tuple[Optional[pd.Series], int]:
+    rcs_country_agnostic: Optional[Dict[str, List[int]]] = None,
+) -> Tuple[Optional[pd.Series], int, str]:
     """
-    Recherche approximative par numéro de registre — critère de contenance.
+    Recherche approximative par contenance, restreinte au pays cible si fourni.
+    Score = len(client) / len(gleif) × 100.
 
-    Stratégie :
-      1. Filtre par longueur : seules les clés GLEIF dont la longueur est dans
-         [len(rcs_norm), len(rcs_norm)+2] sont considérées (le RCS client doit
-         être plus court ou égal au RCS GLEIF).
-      2. Contenance : le RCS client doit apparaître en tant que sous-chaîne
-         du RCS GLEIF.
-         → Détecte les caractères manquants dans le référentiel client :
-           "1513210151" ⊆ "01513210151"  (zéro de tête absent du référentiel)
-           "ABCDE123"   ⊆ "XABCDE123"   (préfixe absent)
-      3. Score = len(rcs_client) / len(rcs_gleif) × 100  (≥ threshold requis).
-
-    Ce critère est plus strict que fuzz.ratio : deux chaînes de longueurs
-    proches mais de contenu différent ne produiront jamais de faux positif.
-
-    Retourne :
-      (row, score)  si trouvé,  (None, 0)  sinon.
+    Retourne (row, score, country_status).
     """
     if not rcs_norm or len(rcs_norm) < 4:
-        return None, 0
-
+        return None, 0, "none"
     n = len(rcs_norm)
-    best_row  = None
-    best_score = 0
+    best_row, best_score, best_status = None, 0, "none"
 
-    for key, idxs in rcs_index.items():
-        key_len = len(key)
-        # Filtre longueur : la clé GLEIF doit être ≥ RCS client
-        # et la différence ne peut excéder 2 caractères
-        if key_len < n or (key_len - n) > 2:
-            continue
+    if iso_country:
+        # Cherche uniquement parmi les RCS du pays cible
+        for (key, key_iso), idxs in rcs_index.items():
+            if key_iso != iso_country:
+                continue
+            key_len = len(key)
+            if key_len < n or (key_len - n) > 2:
+                continue
+            if rcs_norm in key:
+                score = round(n / key_len * 100)
+                if score >= threshold and score > best_score:
+                    best_score, best_row, best_status = score, df.iloc[idxs[0]], "strict"
+        if best_row is not None:
+            return best_row, best_score, best_status
 
-        if rcs_norm in key:
-            score = round(n / key_len * 100)
-            if score >= threshold and score > best_score:
-                best_score = score
-                best_row   = df.iloc[idxs[0]]
+    # Fallback country-agnostic
+    if rcs_country_agnostic is not None:
+        for key, idxs in rcs_country_agnostic.items():
+            key_len = len(key)
+            if key_len < n or (key_len - n) > 2:
+                continue
+            if rcs_norm in key:
+                score = round(n / key_len * 100)
+                if score >= threshold and score > best_score:
+                    best_score, best_row, best_status = score, df.iloc[idxs[0]], "agnostic"
 
-    return best_row, best_score
+    return best_row, best_score, best_status
 
 
 def search_by_lei(
@@ -903,7 +718,6 @@ def search_by_lei(
     lei_index: Dict[str, int],
     df: pd.DataFrame,
 ) -> Optional[pd.Series]:
-    """Lookup direct par code LEI (O(1))."""
     key = str(lei_val).strip().upper()
     if not key:
         return None
@@ -916,26 +730,9 @@ def search_by_name_country(
     iso_country: str,
     name_index: Dict[str, Dict[str, List[int]]],
     df: pd.DataFrame,
-    threshold: int = 80,
+    threshold: int = 90,
     client_postal_digits: str = "",
 ) -> Tuple[Optional[pd.Series], int]:
-    """
-    Recherche approximative par nom + pays (et code postal optionnel).
-
-    Stratégie :
-      1. Filtre les candidats GLEIF dont le nom normalisé est ≥ threshold
-         (via fuzz.token_sort_ratio).
-      2. Si un code postal client (chiffres uniquement) est fourni :
-           • Parmi les candidats retenus, préfère ceux dont le code postal
-             GLEIF brut contient les chiffres du client (contenance).
-           • Ex: "1338" ⊆ "L-1338"  →  candidat luxembourgeois favorisé.
-           • Si aucun candidat n'a de code postal correspondant : retourne
-             le meilleur par score nom (comportement dégradé gracieux).
-      3. Sans code postal : retourne le meilleur candidat par score nom
-         (comportement original).
-
-    Retourne (row, score_nom) ou (None, 0).
-    """
     if not name_norm or not iso_country:
         return None, 0
     country_names = name_index.get(iso_country, {})
@@ -943,210 +740,179 @@ def search_by_name_country(
         return None, 0
 
     if not client_postal_digits:
-        # Comportement original : meilleur score nom uniquement
         result = process.extractOne(
-            name_norm,
-            list(country_names.keys()),
-            scorer=fuzz.token_sort_ratio,
-            score_cutoff=threshold,
+            name_norm, list(country_names.keys()),
+            scorer=fuzz.token_sort_ratio, score_cutoff=threshold,
         )
         if result is None:
             return None, 0
         best_name, score, _ = result
         return df.iloc[country_names[best_name][0]], int(score)
 
-    # Avec code postal : récupérer les 10 meilleurs candidats par score nom
     candidates = process.extract(
-        name_norm,
-        list(country_names.keys()),
-        scorer=fuzz.token_sort_ratio,
-        score_cutoff=threshold,
-        limit=10,
+        name_norm, list(country_names.keys()),
+        scorer=fuzz.token_sort_ratio, score_cutoff=threshold, limit=10,
     )
     if not candidates:
         return None, 0
-
-    # Parmi les candidats, préférer celui dont le code postal correspond
     for cand_name, name_score, _ in candidates:
         row = df.iloc[country_names[cand_name][0]]
         gleif_postal = str(row.get("postal_code", "")).strip()
         if gleif_postal and client_postal_digits in gleif_postal:
             return row, int(name_score)
-
-    # Aucun candidat avec code postal correspondant → meilleur par nom
     best_name, score, _ = candidates[0]
     return df.iloc[country_names[best_name][0]], int(score)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Contrôle qualité : écarts entre référentiel client et GLEIF
+# Discordance "métier" — messages lisibles par un humain
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _check_data_gaps(
+def _trunc(s: str, max_len: int = 60) -> str:
+    s = str(s).strip()
+    return s if len(s) <= max_len else s[: max_len - 1] + "…"
+
+
+def compute_discordances(
     gleif_row: pd.Series,
-    client_rcs_raw: str = "",
-    client_name_raw: str = "",
-    client_iso: str = "",
+    client_name: str = "",
+    client_rcs: str = "",
+    client_pays_iso: str = "",
     client_lei: str = "",
-    client_date_raw: str = "",
-    client_postal_raw: str = "",
-    name_threshold: int = 70,
+    client_date: str = "",
+    name_threshold: int = NAME_DQ_THRESHOLD,
 ) -> Dict[str, str]:
     """
-    Détecte et décrit tous les écarts entre le référentiel client et GLEIF.
+    Génère 3 messages métier :
+      • disc_nom : « Nom différent : "X" vs "Y" »   ou ""
+      • disc_rcs : « RCS différent : "X" vs "Y" »  /  « Pays différent : FR vs DE »  ou ""
+      • disc_lei : « LEI différent : "X" vs "Y" »  /  « LEI absent côté source »  ou ""
 
-    Contrôles effectués pour tous les types de correspondance :
-      1. LEI        — manquant côté client  OU  différent de GLEIF
-      2. RCS        — manquant côté client  OU  différent (après normalisation)
-      3. Nom        — similarité < name_threshold (seulement si les deux ont une valeur)
-      4. Date       — manquante côté client OU  différente de GLEIF (après normalisation)
-      5. CodePostal — vrais écarts (chiffres différents) OU écart de format
-                      (chiffres identiques mais libellé différent, ex: '1338' vs 'L-1338')
-
-    Retourne un dictionnaire {clé → message} avec les clés :
-      "lei", "rcs", "nom", "date", "postal"
-    Chaque valeur est vide ("") si aucun écart n'est détecté sur ce champ.
+    La date est intégrée dans disc_lei pour réduire la surface (cohérence métier :
+    la date de validité est attachée au LEI).
     """
-    disc: Dict[str, str] = {"lei": "", "rcs": "", "nom": "", "date": "", "postal": ""}
+    out = {"nom": "", "rcs": "", "lei": ""}
 
-    # ── 1. LEI ───────────────────────────────────────────────────────────────
-    lei_client = str(client_lei).strip().upper() if client_lei else ""
-    lei_gleif_raw = str(gleif_row.get("lei", "")).strip()
-    lei_gleif = lei_gleif_raw.upper()
-    if not lei_client and lei_gleif:
-        disc["lei"] = f"LEI manquant → GLEIF: '{lei_gleif_raw}'"
-    elif lei_client and lei_gleif and lei_client != lei_gleif:
-        disc["lei"] = f"LEI: client='{client_lei.strip()}' ≠ GLEIF='{lei_gleif_raw}'"
+    name_g = str(gleif_row.get("name", "")).strip()
+    rcs_g  = str(gleif_row.get("ra_entity", "")).strip()
+    pays_g = str(gleif_row.get("country", "")).strip().upper()
+    lei_g  = str(gleif_row.get("lei", "")).strip()
+    date_g_raw = str(gleif_row.get("renewal_date", "")).strip()
+    date_g = normalize_date(date_g_raw)
 
-    # ── 2. RCS ───────────────────────────────────────────────────────────────
-    rcs_client_clean = str(client_rcs_raw).strip() if client_rcs_raw else ""
-    rcs_gleif_raw    = str(gleif_row.get("ra_entity", "")).strip()
-    rcs_norm_c = normalize_rcs(rcs_client_clean) if rcs_client_clean else ""
-    rcs_norm_g = normalize_rcs(rcs_gleif_raw)    if rcs_gleif_raw    else ""
-    if not rcs_norm_c and rcs_norm_g:
-        disc["rcs"] = f"RCS manquant → GLEIF: '{rcs_gleif_raw}'"
-    elif rcs_norm_c and rcs_norm_g and rcs_norm_c != rcs_norm_g:
-        disc["rcs"] = f"RCS: client='{rcs_client_clean}' ≠ GLEIF='{rcs_gleif_raw}'"
+    # ── Discordance Nom ─────────────────────────────────────────────────────
+    name_c = (client_name or "").strip()
+    if name_c and name_g:
+        n_c, n_g = normalize_name(name_c), normalize_name(name_g)
+        if n_c and n_g and fuzz.token_sort_ratio(n_c, n_g) < name_threshold:
+            out["nom"] = f'Nom différent : "{_trunc(name_c)}" vs "{_trunc(name_g)}"'
+    elif name_c and not name_g:
+        out["nom"] = f'Nom GLEIF absent (source : "{_trunc(name_c)}")'
+    elif name_g and not name_c:
+        out["nom"] = f'Nom source absent (GLEIF : "{_trunc(name_g)}")'
 
-    # ── 3. Nom légal ─────────────────────────────────────────────────────────
-    name_client_clean = str(client_name_raw).strip() if client_name_raw else ""
-    name_gleif_clean  = str(gleif_row.get("name", "")).strip()
-    if name_client_clean and name_gleif_clean:
-        n_c = normalize_name(name_client_clean)
-        n_g = normalize_name(name_gleif_clean)
-        if n_c and n_g:
-            score = fuzz.token_sort_ratio(n_c, n_g)
-            if score < name_threshold:
-                disc["nom"] = (
-                    f"Nom: client='{name_client_clean}' ≠ GLEIF='{name_gleif_clean}' "
-                    f"(sim={score}%)"
-                )
+    # ── Discordance RCS / Pays ──────────────────────────────────────────────
+    rcs_c = (client_rcs or "").strip()
+    rcs_msgs: List[str] = []
+    if rcs_c and rcs_g:
+        if normalize_rcs(rcs_c) != normalize_rcs(rcs_g):
+            rcs_msgs.append(f'RCS différent : "{_trunc(rcs_c, 30)}" vs "{_trunc(rcs_g, 30)}"')
+    elif rcs_c and not rcs_g:
+        rcs_msgs.append(f'RCS GLEIF absent (source : "{_trunc(rcs_c, 30)}")')
+    elif rcs_g and not rcs_c:
+        rcs_msgs.append(f'RCS source absent (GLEIF : "{_trunc(rcs_g, 30)}")')
 
-    # ── 4. Date de validité LEI ───────────────────────────────────────────────
-    date_gleif_raw = str(gleif_row.get("renewal_date", "")).strip()
-    date_gleif     = normalize_date(date_gleif_raw)
-    date_client    = normalize_date(client_date_raw) if client_date_raw else None
-    if not date_client and date_gleif:
-        disc["date"] = f"Date LEI manquante → GLEIF: '{date_gleif.strftime('%d-%m-%Y')}'"
-    elif date_client and date_gleif and date_client != date_gleif:
-        disc["date"] = (
-            f"Date LEI: client='{date_client.strftime('%d-%m-%Y')}' "
-            f"≠ GLEIF='{date_gleif.strftime('%d-%m-%Y')}'"
+    iso_c = (client_pays_iso or "").strip().upper()
+    if iso_c and pays_g and iso_c != pays_g:
+        rcs_msgs.append(f'Pays différent : {iso_c} vs {pays_g}')
+    elif not iso_c and pays_g:
+        rcs_msgs.append(f'Pays source absent (GLEIF : {pays_g})')
+
+    out["rcs"] = " | ".join(rcs_msgs)
+
+    # ── Discordance LEI / Date ──────────────────────────────────────────────
+    lei_c = (client_lei or "").strip()
+    lei_msgs: List[str] = []
+    if lei_c and lei_g:
+        if lei_c.upper() != lei_g.upper():
+            lei_msgs.append(f'LEI différent : "{lei_c}" vs "{lei_g}"')
+    elif lei_c and not lei_g:
+        lei_msgs.append(f'LEI GLEIF absent (source : "{lei_c}")')
+    elif lei_g and not lei_c:
+        lei_msgs.append(f'LEI source absent (GLEIF : "{lei_g}")')
+
+    date_c = normalize_date(client_date) if client_date else None
+    if date_c and date_g and date_c != date_g:
+        lei_msgs.append(
+            f'Date validité différente : {date_c.strftime("%d-%m-%Y")} '
+            f'vs {date_g.strftime("%d-%m-%Y")}'
         )
+    elif not date_c and date_g and client_date:
+        lei_msgs.append(f'Date validité source illisible (GLEIF : {date_g.strftime("%d-%m-%Y")})')
 
-    # ── 5. Code postal ────────────────────────────────────────────────────────
-    # Deux niveaux d'écart détectés :
-    #   a) Vrais écarts      : chiffres client ∉ code postal GLEIF
-    #   b) Écart de format   : chiffres identiques mais libellé différent
-    #      (ex : client='1338', GLEIF='L-1338') → à harmoniser dans le référentiel
-    postal_gleif_raw    = str(gleif_row.get("postal_code", "")).strip()
-    postal_client_clean = str(client_postal_raw).strip() if client_postal_raw else ""
-    postal_client_digits = normalize_postal_code(postal_client_clean) if postal_client_clean else ""
-    if postal_client_digits and postal_gleif_raw:
-        if postal_client_digits not in postal_gleif_raw:
-            # Vrai écart : codes postaux différents
-            disc["postal"] = (
-                f"CP: client='{postal_client_clean}' ≠ GLEIF='{postal_gleif_raw}'"
-            )
-        elif postal_client_clean != postal_gleif_raw:
-            # Format différent mais chiffres identiques → signaler pour harmonisation DQ
-            disc["postal"] = (
-                f"Format CP: client='{postal_client_clean}' → GLEIF='{postal_gleif_raw}' "
-                f"(à harmoniser)"
-            )
-    # Si GLEIF n'a pas de code postal : pas d'alerte
-
-    return disc
-
-
-def _check_lei_discordance(
-    gleif_row: pd.Series,
-    client_rcs_raw: str,
-    client_name_raw: str,
-    client_iso: str,
-    client_lei: str = "",
-    name_threshold: int = 70,
-) -> Tuple[str, bool]:
-    """
-    Compare les données du client avec celles retournées par GLEIF.
-
-    Vérifications effectuées (dans l'ordre) :
-      - LEI    : comparaison exacte client vs GLEIF (utile quand l'entité a été
-                 retrouvée par RCS/nom après échec du lookup direct par LEI)
-      - RCS    : comparaison exacte après normalisation
-      - Nom    : similarité fuzzy token_sort_ratio ≥ name_threshold (défaut 70 %)
-      - Pays   : comparaison ISO alpha-2
-
-    Retourne :
-      (texte_discordance, is_discordant)
-      texte_discordance = "" si aucune divergence détectée
-    """
-    issues: List[str] = []
-
-    # ── Comparaison LEI (client vs GLEIF) ────────────────────────────────────
-    # Pertinent quand l'entité a été retrouvée par RCS/nom et non par LEI direct
-    lei_client = str(client_lei).strip().upper() if client_lei else ""
-    lei_gleif  = str(gleif_row.get("lei", "")).strip().upper()
-    if lei_client and lei_gleif and lei_client != lei_gleif:
-        issues.append(
-            f"LEI: client='{client_lei.strip()}' ≠ GLEIF='{gleif_row.get('lei', '')}'"
-        )
-
-    # ── Vérification RCS ─────────────────────────────────────────────────────
-    rcs_client = client_rcs_raw.strip() if client_rcs_raw else ""
-    if rcs_client:
-        rcs_norm_c = normalize_rcs(rcs_client)
-        rcs_norm_g = normalize_rcs(str(gleif_row.get("ra_entity", "")))
-        if rcs_norm_c and rcs_norm_g and rcs_norm_c != rcs_norm_g:
-            issues.append(
-                f"RCS: client='{rcs_client}' ≠ GLEIF='{gleif_row.get('ra_entity', '')}'"
-            )
-
-    # ── Vérification Nom ─────────────────────────────────────────────────────
-    name_client = client_name_raw.strip() if client_name_raw else ""
-    if name_client:
-        name_norm_c = normalize_name(name_client)
-        name_norm_g = normalize_name(str(gleif_row.get("name", "")))
-        if name_norm_c and name_norm_g:
-            score = fuzz.token_sort_ratio(name_norm_c, name_norm_g)
-            if score < name_threshold:
-                issues.append(
-                    f"Nom: client='{name_client}' ≠ GLEIF='{gleif_row.get('name', '')}' "
-                    f"(similarité={score}%)"
-                )
-
-    # ── Vérification Pays ────────────────────────────────────────────────────
-    if client_iso and client_iso.strip():
-        country_g = str(gleif_row.get("country", "")).strip().upper()
-        if country_g and client_iso.upper() != country_g:
-            issues.append(f"Pays: client={client_iso} ≠ GLEIF={country_g}")
-
-    disc_text = " | ".join(issues)
-    return disc_text, bool(issues)
+    out["lei"] = " | ".join(lei_msgs)
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Pipeline de rapprochement principal
+# Fiabilité + action requise
+# ─────────────────────────────────────────────────────────────────────────────
+
+OK = "OK"
+A_VERIFIER = "À vérifier"
+KO = "KO"
+
+ACTION_OK = "Aucune"
+ACTION_VERIF = "Vérification manuelle des libellés/pays requise"
+ACTION_VERIF_PAYS_ABSENT = "Vérification manuelle requise (pays source absent)"
+ACTION_KO = "Rechercher manuellement sur le site GLEIF ou contacter l'entité"
+
+
+def compute_fiabilite(
+    match_type: str,
+    country_status: str,           # "strict" | "agnostic" | "none" | "n/a"
+    discordances: Dict[str, str],
+    gleif_row: Optional[pd.Series],
+) -> Tuple[str, str]:
+    """
+    Détermine (Fiabilite, ActionRequise) selon les règles métier SG.
+
+    OK         → Match exact RCS + Pays cohérent + aucune discordance significative
+                 OU LEI Valide (lookup direct + données cohérentes)
+    À vérifier → Toute approximation, ou pays source absent, ou discordance résiduelle
+    KO         → LEI Discordant, Non trouvé, ou tout cas où aucune entité GLEIF
+                 fiable ne peut être proposée
+    """
+    has_disc = any(v for v in discordances.values())
+
+    if match_type in ("Non trouvé", "Non trouvé (LEI invalide)"):
+        return KO, ACTION_KO
+    if match_type == "LEI Discordant":
+        return KO, ACTION_KO
+
+    if match_type == "LEI Valide":
+        if has_disc:
+            return A_VERIFIER, ACTION_VERIF
+        return OK, ACTION_OK
+
+    if match_type == "Exact – RCS":
+        if country_status == "agnostic":
+            return A_VERIFIER, ACTION_VERIF_PAYS_ABSENT
+        if has_disc:
+            return A_VERIFIER, ACTION_VERIF
+        return OK, ACTION_OK
+
+    if match_type in ("Approx – RCS", "Approx – Nom/Pays"):
+        if country_status == "agnostic":
+            return A_VERIFIER, ACTION_VERIF_PAYS_ABSENT
+        return A_VERIFIER, ACTION_VERIF
+
+    # Type inconnu → conservatisme
+    return A_VERIFIER, ACTION_VERIF
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pipeline principal
 # ─────────────────────────────────────────────────────────────────────────────
 
 def match_companies(
@@ -1156,39 +922,20 @@ def match_companies(
     col_rcs: str = "RCS",
     col_name: str = "NomEntreprise",
     col_pays: str = "Pays",
-    col_lei: Optional[str] = None,          # colonne LEI existant (v1.2)
-    col_date: Optional[str] = None,         # colonne date validité LEI (v1.4)
-    col_postal: Optional[str] = None,       # colonne code postal client (v1.5)
-    fuzzy_threshold: int = 80,
+    col_lei: Optional[str] = None,
+    col_date: Optional[str] = None,
+    col_postal: Optional[str] = None,
+    fuzzy_threshold: int = 90,
     rcs_fuzzy_threshold: int = 88,
     active_only: bool = True,
     progress_cb: Optional[Callable[[int, int], None]] = None,
     status_cb: Optional[Callable[[str], None]] = None,
-) -> pd.DataFrame:
+) -> Tuple[pd.DataFrame, Dict[str, int]]:
     """
-    Pipeline complet de rapprochement.
+    Pipeline complet de rapprochement v2.0.
 
-    Paramètres
-    ----------
-    col_lei    : colonne LEI existants (optionnel). Si présente et non vide → mode validation.
-    col_date   : colonne date validité LEI côté client (optionnel, format dd-mm-yyyy).
-                 Comparée avec GLEIF renewal_date ; écart signalé dans LEI_Discordance.
-    col_postal : colonne code postal côté client (optionnel).
-                 Utilisée pour affiner le matching nom/pays :
-                   • Les chiffres du code postal client doivent être contenus dans
-                     le code postal GLEIF (ex: "1338" ⊆ "L-1338").
-                   • Parmi plusieurs candidats nom/pays, préfère celui dont le
-                     code postal correspond.
-                   • Écart signalé dans LEI_Discordance si non conforme.
-
-    Note : quand col_lei est fourni, le chargement GLEIF ignore le filtre
-    active_only afin de retrouver même les LEI expirés (LAPSED / INACTIVE).
-    Le statut réel est reporté dans GLEIF_StatutSociete et GLEIF_StatutLEI.
-
-    La colonne LEI_Discordance signale tous les écarts DQ pour chaque ligne
-    ayant une correspondance (LEI manquant, RCS manquant/différent, nom
-    différent, date manquante/différente, code postal différent) — applicable
-    à tous les types de correspondance, pas uniquement au mode validation LEI.
+    Retourne (df_output, stats) où stats contient les compteurs par fiabilité
+    et par type de correspondance.
     """
     def _status(msg):
         log.info(msg)
@@ -1199,7 +946,6 @@ def match_companies(
     df_input = _safe_read_excel(input_path).fillna("")
     _status(f"  {len(df_input):,} lignes chargées")
 
-    # Validation des colonnes obligatoires
     required = [c for c in [col_rcs, col_name, col_pays] if c]
     missing_cols = [c for c in required if c not in df_input.columns]
     if missing_cols:
@@ -1208,37 +954,28 @@ def match_companies(
             f"Colonnes disponibles : {list(df_input.columns)}"
         )
 
-    # Détermination du mode LEI
-    has_lei_col = bool(col_lei) and col_lei in df_input.columns
-    if has_lei_col:
-        _status(
-            f"  Colonne LEI détectée : '{col_lei}' — mode validation activé.\n"
-            "  Chargement de tous les statuts GLEIF pour retrouver les LEI expirés."
-        )
+    has_lei_col    = bool(col_lei)    and col_lei    in df_input.columns
+    has_date_col   = bool(col_date)   and col_date   in df_input.columns
+    has_postal_col = bool(col_postal) and col_postal in df_input.columns
 
-    # Chargement GLEIF
-    # Si mode validation LEI : charger TOUS les statuts (pour trouver les LAPSED)
+    if has_lei_col:
+        _status(f"  Mode validation LEI activé via '{col_lei}' — chargement tous statuts.")
     _active_only_load = active_only if not has_lei_col else False
-    df_gleif = load_gleif(
-        gleif_path,
-        active_only=_active_only_load,
-        status_cb=status_cb,
-    )
-    rcs_index, name_index, lei_index = build_indices(df_gleif)
+
+    df_gleif = load_gleif(gleif_path, active_only=_active_only_load, status_cb=status_cb)
+    rcs_index, name_index, lei_index, rcs_agnostic = build_indices(df_gleif)
 
     results = []
     n_total = len(df_input)
-    n_exact = n_approx_rcs = n_approx = n_miss = 0
-    n_valid = n_discordant = n_lei_unknown = 0
+    stats = {
+        "total": n_total,
+        "ok": 0, "a_verifier": 0, "ko": 0,
+        "exact_rcs": 0, "approx_rcs": 0, "approx_nom": 0,
+        "lei_valide": 0, "lei_discordant": 0, "lei_invalide": 0,
+        "non_trouve": 0,
+    }
 
     _status("Rapprochement en cours …")
-
-    has_date_col   = bool(col_date)   and col_date   in df_input.columns
-    has_postal_col = bool(col_postal) and col_postal in df_input.columns
-    if has_date_col:
-        _status(f"  Colonne date LEI détectée : '{col_date}' — contrôle de la date activé.")
-    if has_postal_col:
-        _status(f"  Colonne code postal détectée : '{col_postal}' — affinage matching nom/pays activé.")
 
     for idx, row in df_input.iterrows():
         rcs_raw    = str(row[col_rcs]).strip()    if col_rcs    in df_input.columns else ""
@@ -1253,335 +990,434 @@ def match_companies(
         iso           = country_to_iso(pays_raw)
         postal_digits = normalize_postal_code(postal_raw) if postal_raw else ""
 
-        gleif_row   = None
-        match_type  = "Non trouvé"
-        match_score = ""
-        disc: Dict[str, str] = {"lei": "", "rcs": "", "nom": "", "date": "", "postal": ""}
+        gleif_row: Optional[pd.Series] = None
+        match_type     = "Non trouvé"
+        country_status = "n/a"
 
-        # ── Mode 1 : validation d'un LEI existant ────────────────────────────
+        # ── Mode 1 : validation LEI existant ─────────────────────────────────
         if lei_exist:
             gleif_row = search_by_lei(lei_exist, lei_index, df_gleif)
-
             if gleif_row is not None:
-                # LEI trouvé directement : match_type basé sur comparaison LEI
                 lei_g = str(gleif_row.get("lei", "")).strip().upper()
-                lei_c = str(lei_exist).strip().upper()
+                lei_c = lei_exist.strip().upper()
                 if lei_c and lei_g and lei_c != lei_g:
                     match_type = "LEI Discordant"
-                    n_discordant += 1
+                    stats["lei_discordant"] += 1
                 else:
                     match_type = "LEI Valide"
-                    n_valid += 1
-                # Tous les écarts DQ pour cette ligne (LEI + RCS + Nom + Date + CP)
-                disc = _check_data_gaps(
-                    gleif_row, rcs_raw, name_raw, iso,
-                    client_lei=lei_exist, client_date_raw=date_raw,
-                    client_postal_raw=postal_raw,
-                )
-
+                    stats["lei_valide"] += 1
+                # Pour un lookup LEI direct, le pays GLEIF fait foi → strict
+                country_status = "strict"
             else:
-                # LEI introuvable dans GLEIF → fallback par RCS/nom pour
-                # retrouver l'entité et comparer le bon LEI avec celui du client
+                # Fallback RCS+Pays / Nom+Pays
                 fallback_row = None
-
                 if rcs_norm:
-                    fallback_row = search_by_rcs(rcs_norm, rcs_index, df_gleif)
-                    if fallback_row is None and rcs_fuzzy_threshold > 0:
-                        fallback_row, _fb_rcs_score = search_by_rcs_fuzzy(
-                            rcs_norm, rcs_index, df_gleif, rcs_fuzzy_threshold
-                        )
-
-                if fallback_row is None and name_norm:
-                    fallback_row, _score = search_by_name_country(
-                        name_norm, iso, name_index, df_gleif, fuzzy_threshold,
-                        client_postal_digits=postal_digits,
+                    fb_row, fb_status = search_by_rcs(
+                        rcs_norm, iso, rcs_index, df_gleif, rcs_agnostic
                     )
+                    if fb_row is None and rcs_fuzzy_threshold < 100:
+                        fb_row, _, fb_status = search_by_rcs_fuzzy(
+                            rcs_norm, iso, rcs_index, df_gleif,
+                            rcs_fuzzy_threshold, rcs_agnostic,
+                        )
+                    if fb_row is not None:
+                        fallback_row = fb_row
+                        country_status = fb_status
+                if fallback_row is None and name_norm and iso:
+                    fb_row, _ = search_by_name_country(
+                        name_norm, iso, name_index, df_gleif,
+                        fuzzy_threshold, postal_digits,
+                    )
+                    if fb_row is not None:
+                        fallback_row = fb_row
+                        country_status = "strict"  # name_country est par construction iso-strict
 
                 if fallback_row is not None:
-                    gleif_row  = fallback_row
+                    gleif_row = fallback_row
                     match_type = "LEI Discordant"
-                    n_discordant += 1
-                    # Tous les écarts DQ (_check_data_gaps inclut la comparaison LEI)
-                    disc = _check_data_gaps(
-                        gleif_row, rcs_raw, name_raw, iso,
-                        client_lei=lei_exist, client_date_raw=date_raw,
-                        client_postal_raw=postal_raw,
-                    )
+                    stats["lei_discordant"] += 1
                 else:
                     match_type = "Non trouvé (LEI invalide)"
-                    n_lei_unknown += 1
+                    stats["lei_invalide"] += 1
 
         # ── Mode 2 : recherche d'un LEI manquant ─────────────────────────────
         else:
-            # ── 2a. Correspondance RCS exacte ────────────────────────────────
+            # 2a. RCS + Pays exact
             if rcs_norm:
-                gleif_row = search_by_rcs(rcs_norm, rcs_index, df_gleif)
+                gleif_row, country_status = search_by_rcs(
+                    rcs_norm, iso, rcs_index, df_gleif, rcs_agnostic
+                )
                 if gleif_row is not None:
                     if active_only:
                         es = str(gleif_row.get("entity_status", "")).upper()
                         ls = str(gleif_row.get("lei_status", "")).upper()
                         if es != "ACTIVE" or ls != "ISSUED":
                             gleif_row = None
+                            country_status = "n/a"
                     if gleif_row is not None:
-                        match_type  = "Exact – RCS"
-                        match_score = 100
-                        n_exact    += 1
+                        match_type = "Exact – RCS"
+                        stats["exact_rcs"] += 1
 
-            # ── 2b. Correspondance RCS approchée ─────────────────────────────
-            # Intercalée entre exact RCS et fuzzy nom, elle gère les cas :
-            #   • zéro(s) de tête différents : "1513210151" vs "01513210151"
-            #     (résolu aussi par normalize_rcs, cette étape est le filet)
-            #   • faute de frappe mineure, formatage légèrement différent
-            if gleif_row is None and rcs_norm and rcs_fuzzy_threshold > 0:
-                approx_row, rcs_score = search_by_rcs_fuzzy(
-                    rcs_norm, rcs_index, df_gleif, rcs_fuzzy_threshold
+            # 2b. RCS approché (zéros de tête, fautes mineures)
+            if gleif_row is None and rcs_norm and rcs_fuzzy_threshold < 100:
+                approx_r, _rcs_sc, fuzzy_status = search_by_rcs_fuzzy(
+                    rcs_norm, iso, rcs_index, df_gleif,
+                    rcs_fuzzy_threshold, rcs_agnostic,
                 )
-                if approx_row is not None:
+                if approx_r is not None:
                     if active_only:
-                        es = str(approx_row.get("entity_status", "")).upper()
-                        ls = str(approx_row.get("lei_status", "")).upper()
+                        es = str(approx_r.get("entity_status", "")).upper()
+                        ls = str(approx_r.get("lei_status", "")).upper()
                         if es != "ACTIVE" or ls != "ISSUED":
-                            approx_row = None
-                    if approx_row is not None:
-                        # Validation secondaire : similarité nom pour s'assurer
-                        # qu'il ne s'agit pas d'une coïncidence de numéro
-                        gl_name_norm = normalize_name(str(approx_row.get("name", "")))
-                        name_sim = (
-                            fuzz.token_sort_ratio(name_norm, gl_name_norm)
-                            if name_norm and gl_name_norm else ""
-                        )
-                        match_score = (
-                            f"RCS:{rcs_score}% / Nom:{name_sim}%"
-                            if name_sim != "" else f"RCS:{rcs_score}%"
-                        )
+                            approx_r = None
+                    if approx_r is not None:
                         match_type = "Approx – RCS"
-                        gleif_row  = approx_row
-                        n_approx_rcs += 1
+                        gleif_row = approx_r
+                        country_status = fuzzy_status
+                        stats["approx_rcs"] += 1
 
-            # ── 2c. Correspondance approximative nom + pays (+ code postal) ───
-            if gleif_row is None and name_norm:
-                gleif_row, score = search_by_name_country(
-                    name_norm, iso, name_index, df_gleif, fuzzy_threshold,
-                    client_postal_digits=postal_digits,
+            # 2c. Nom + Pays
+            if gleif_row is None and name_norm and iso:
+                row_nm, _ = search_by_name_country(
+                    name_norm, iso, name_index, df_gleif,
+                    fuzzy_threshold, postal_digits,
                 )
-                if gleif_row is not None:
+                if row_nm is not None:
                     if active_only:
-                        es = str(gleif_row.get("entity_status", "")).upper()
-                        ls = str(gleif_row.get("lei_status", "")).upper()
+                        es = str(row_nm.get("entity_status", "")).upper()
+                        ls = str(row_nm.get("lei_status", "")).upper()
                         if es != "ACTIVE" or ls != "ISSUED":
-                            gleif_row = None
-                            score = 0
-                    if gleif_row is not None:
+                            row_nm = None
+                    if row_nm is not None:
                         match_type = "Approx – Nom/Pays"
-                        # Indicateur code postal dans le score si fourni
-                        if postal_digits:
-                            gleif_postal = str(gleif_row.get("postal_code", "")).strip()
-                            cp_ok = bool(gleif_postal and postal_digits in gleif_postal)
-                            match_score = f"Nom:{score}% / CP:{'✓' if cp_ok else '✗'}"
-                        else:
-                            match_score = score
-                        n_approx += 1
+                        gleif_row = row_nm
+                        country_status = "strict"
+                        stats["approx_nom"] += 1
 
             if gleif_row is None:
-                n_miss += 1
-            else:
-                # Écarts DQ pour tous les types de correspondance Mode 2
-                disc = _check_data_gaps(
-                    gleif_row, rcs_raw, name_raw, iso,
-                    client_lei=lei_exist, client_date_raw=date_raw,
-                    client_postal_raw=postal_raw,
-                )
+                stats["non_trouve"] += 1
 
-        # ── Construction de la ligne de résultat ─────────────────────────────
+        # ── Discordances + Fiabilité ─────────────────────────────────────────
         if gleif_row is not None:
-            results.append({
-                "LEI_GLEIF":                gleif_row["lei"],
-                "GLEIF_NomLegal":           gleif_row["name"],
-                "GLEIF_Pays":               gleif_row["country"],
-                "GLEIF_StatutSociete":      gleif_row["entity_status"],
-                "GLEIF_StatutLEI":          gleif_row["lei_status"],
-                "GLEIF_AutoriteRegistre":   gleif_row["ra_id"],
-                "GLEIF_NumRegistre":        gleif_row["ra_entity"],
-                "GLEIF_DateRenouvellement": gleif_row["renewal_date"],
-                "GLEIF_CodePostal":         gleif_row.get("postal_code", ""),
-                "TypeCorrespondance":       match_type,
-                "ScoreCorrespondance":      match_score,
-                "Disc_LEI":                 disc["lei"],
-                "Disc_RCS":                 disc["rcs"],
-                "Disc_Nom":                 disc["nom"],
-                "Disc_Date":                disc["date"],
-                "Disc_CodePostal":          disc["postal"],
-            })
+            disc = compute_discordances(
+                gleif_row,
+                client_name=name_raw, client_rcs=rcs_raw,
+                client_pays_iso=iso, client_lei=lei_exist,
+                client_date=date_raw,
+            )
         else:
-            results.append({
-                "LEI_GLEIF": "", "GLEIF_NomLegal": "", "GLEIF_Pays": "",
-                "GLEIF_StatutSociete": "", "GLEIF_StatutLEI": "",
-                "GLEIF_AutoriteRegistre": "", "GLEIF_NumRegistre": "",
-                "GLEIF_DateRenouvellement": "", "GLEIF_CodePostal": "",
-                "TypeCorrespondance":  match_type,
-                "ScoreCorrespondance": "",
-                "Disc_LEI": "", "Disc_RCS": "", "Disc_Nom": "",
-                "Disc_Date": "", "Disc_CodePostal": "",
-            })
+            disc = {"nom": "", "rcs": "", "lei": ""}
+
+        fiabilite, action = compute_fiabilite(match_type, country_status, disc, gleif_row)
+        if   fiabilite == OK:         stats["ok"] += 1
+        elif fiabilite == A_VERIFIER: stats["a_verifier"] += 1
+        else:                          stats["ko"] += 1
+
+        # Construction de la ligne résultat (blocs thématiques)
+        result_row = {
+            # ── Bloc Identité ──
+            "Nom_Source":       name_raw,
+            "Nom_GLEIF":        gleif_row["name"] if gleif_row is not None else "",
+            "Discordance_Nom":  disc["nom"],
+            # ── Bloc Légal ──
+            "RCS_Source":       rcs_raw,
+            "Pays_Source":      iso or pays_raw,
+            "RCS_GLEIF":        gleif_row["ra_entity"] if gleif_row is not None else "",
+            "Pays_GLEIF":       gleif_row["country"]   if gleif_row is not None else "",
+            "Discordance_RCS":  disc["rcs"],
+            # ── Bloc LEI ──
+            "LEI_Source":            lei_exist,
+            "LEI_GLEIF":             gleif_row["lei"]            if gleif_row is not None else "",
+            "Statut_LEI_GLEIF":      gleif_row["lei_status"]     if gleif_row is not None else "",
+            "DateValidite_LEI_GLEIF": gleif_row["renewal_date"]  if gleif_row is not None else "",
+            "Discordance_LEI":       disc["lei"],
+            # ── Bloc Synthèse ──
+            "TypeCorrespondance":  match_type,
+            "Fiabilite":           fiabilite,
+            "ActionRequise":       action,
+        }
+        results.append(result_row)
 
         if progress_cb and ((idx + 1) % 10 == 0 or (idx + 1) == n_total):
             progress_cb(idx + 1, n_total)
 
     df_results = pd.DataFrame(results)
-    df_output  = pd.concat([df_input.reset_index(drop=True), df_results], axis=1)
+    df_output = pd.concat([df_input.reset_index(drop=True), df_results], axis=1)
 
     _status(f"Export vers : {output_path}")
-    _export_excel(df_output, output_path, fuzzy_threshold)
+    _export_excel(df_output, output_path, list(df_input.columns), fuzzy_threshold, stats)
 
     log.info(
         f"\n{'='*55}\n"
-        f"  Total             : {n_total:>6,}\n"
-        f"  LEI Valide        : {n_valid:>6,}  ({n_valid/n_total*100:.1f}%)\n"
-        f"  LEI Discordant    : {n_discordant:>6,}  ({n_discordant/n_total*100:.1f}%)\n"
-        f"  LEI Invalide      : {n_lei_unknown:>6,}  ({n_lei_unknown/n_total*100:.1f}%)\n"
-        f"  Exact RCS         : {n_exact:>6,}  ({n_exact/n_total*100:.1f}%)\n"
-        f"  Approx RCS        : {n_approx_rcs:>6,}  ({n_approx_rcs/n_total*100:.1f}%)\n"
-        f"  Approx Nom/Pays   : {n_approx:>6,}  ({n_approx/n_total*100:.1f}%)\n"
-        f"  Non trouvé        : {n_miss:>6,}  ({n_miss/n_total*100:.1f}%)\n"
+        f"  Total           : {stats['total']:>6,}\n"
+        f"  OK              : {stats['ok']:>6,}  ({stats['ok']/n_total*100:.1f}%)\n"
+        f"  À vérifier      : {stats['a_verifier']:>6,}  ({stats['a_verifier']/n_total*100:.1f}%)\n"
+        f"  KO              : {stats['ko']:>6,}  ({stats['ko']/n_total*100:.1f}%)\n"
+        f"  ─ détail ─\n"
+        f"  Exact RCS+Pays  : {stats['exact_rcs']:>6,}\n"
+        f"  Approx RCS      : {stats['approx_rcs']:>6,}\n"
+        f"  Approx Nom/Pays : {stats['approx_nom']:>6,}\n"
+        f"  LEI Valide      : {stats['lei_valide']:>6,}\n"
+        f"  LEI Discordant  : {stats['lei_discordant']:>6,}\n"
+        f"  LEI Invalide    : {stats['lei_invalide']:>6,}\n"
+        f"  Non trouvé      : {stats['non_trouve']:>6,}\n"
         f"{'='*55}"
     )
-    return df_output
+    return df_output, stats
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Export Excel
+# Export Excel — blocs thématiques + Instructions
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _export_excel(df: pd.DataFrame, output_path: str, threshold: int) -> None:
+# Codes couleur Société Générale
+SG_RED   = "E60028"
+SG_BLACK = "000000"
+SG_GREY  = "6B7280"
+
+# Couleurs lignes (pleines, harmonisées avec la GUI)
+ROW_OK_FILL     = "D4EDDA"  # vert clair
+ROW_VERIF_FILL  = "FFF3CD"  # jaune
+ROW_KO_FILL     = "F8D7DA"  # rouge clair
+
+# Couleurs en-têtes des blocs (plus saturées)
+BLOCK_IDENT_HDR  = "1F4E79"  # bleu foncé — Identité
+BLOCK_LEGAL_HDR  = "2E5984"  # bleu — Légal
+BLOCK_LEI_HDR    = "5B5EA6"  # violet — LEI
+BLOCK_SYNTH_HDR  = SG_RED    # rouge SG — Synthèse (focus)
+BLOCK_INPUT_HDR  = "404040"  # gris foncé — Données source
+
+DISCLAIMER_TEXT = (
+    "⚠ AVERTISSEMENT — Outil d'aide à la décision. Les correspondances "
+    "approximatives doivent être validées manuellement avant usage opérationnel. "
+    "Cet outil ne remplace pas le contrôle humain réglementaire."
+)
+
+
+def _export_excel(
+    df: pd.DataFrame,
+    output_path: str,
+    input_columns: List[str],
+    threshold: int,
+    stats: Dict[str, int],
+) -> None:
+    """
+    Export Excel restructuré v2.0 :
+      • Onglet Résultats : colonnes source + 4 blocs (Identité, Légal, LEI, Synthèse)
+      • Onglet Instructions : disclaimer + légende couleurs + logique de fiabilité
+    """
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
 
     wb = Workbook()
     ws = wb.active
-    ws.title = "Résultats LEI"
-
-    HEADER_FILL   = PatternFill("solid", fgColor="1F4E79")
-    GLEIF_FILL    = PatternFill("solid", fgColor="D6E4F0")
-    EXACT_FILL    = PatternFill("solid", fgColor="D9EAD3")   # vert foncé → Exact RCS / LEI Valide
-    APPROX_RCS_FILL = PatternFill("solid", fgColor="EAF4E4") # vert clair → Approx RCS
-    APPROX_FILL   = PatternFill("solid", fgColor="FFF2CC")   # jaune → Approx Nom/Pays
-    DISCORD_FILL  = PatternFill("solid", fgColor="FCE8D0")   # orange → LEI Discordant
-    UNKNOWN_FILL  = PatternFill("solid", fgColor="DAE8FC")   # bleu clair → LEI Invalide
-    MISS_FILL     = PatternFill("solid", fgColor="FCE4D6")   # rouge → Non trouvé
+    ws.title = "Résultats"
 
     thin   = Side(style="thin", color="AAAAAA")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
-    hfont  = Font(name="Arial", bold=True, color="FFFFFF", size=10)
-    dfont  = Font(name="Arial", size=10)
+    base_font  = Font(name="Calibri", size=10)
+    bold_white = Font(name="Calibri", bold=True, color="FFFFFF", size=10)
+    bold_black = Font(name="Calibri", bold=True, size=10)
+    disc_font  = Font(name="Calibri", size=10, color="C00000", bold=True)
 
-    gleif_cols = [
-        "LEI_GLEIF", "GLEIF_NomLegal", "GLEIF_Pays",
-        "GLEIF_StatutSociete", "GLEIF_StatutLEI",
-        "GLEIF_AutoriteRegistre", "GLEIF_NumRegistre",
-        "GLEIF_DateRenouvellement", "GLEIF_CodePostal",
-        "TypeCorrespondance", "ScoreCorrespondance",
-        "Disc_LEI", "Disc_RCS", "Disc_Nom", "Disc_Date", "Disc_CodePostal",
+    # ── Définition des blocs ────────────────────────────────────────────────
+    blocks = [
+        ("DONNÉES SOURCE",                input_columns,                         BLOCK_INPUT_HDR),
+        ("BLOC IDENTITÉ",                 ["Nom_Source", "Nom_GLEIF", "Discordance_Nom"],
+                                                                                 BLOCK_IDENT_HDR),
+        ("BLOC LÉGAL (RCS + Pays)",       ["RCS_Source", "Pays_Source",
+                                           "RCS_GLEIF", "Pays_GLEIF",
+                                           "Discordance_RCS"],                   BLOCK_LEGAL_HDR),
+        ("BLOC LEI",                      ["LEI_Source", "LEI_GLEIF",
+                                           "Statut_LEI_GLEIF",
+                                           "DateValidite_LEI_GLEIF",
+                                           "Discordance_LEI"],                   BLOCK_LEI_HDR),
+        ("SYNTHÈSE",                      ["TypeCorrespondance",
+                                           "Fiabilite", "ActionRequise"],        BLOCK_SYNTH_HDR),
     ]
-    disc_cols = {"Disc_LEI", "Disc_RCS", "Disc_Nom", "Disc_Date", "Disc_CodePostal"}
-    columns = list(df.columns)
 
-    for ci, cn in enumerate(columns, 1):
-        cell = ws.cell(row=1, column=ci, value=cn)
-        cell.font      = hfont
-        cell.fill      = HEADER_FILL
+    # ── Construction de l'ordre final des colonnes ──────────────────────────
+    final_columns: List[str] = []
+    for _, cols, _ in blocks:
+        for c in cols:
+            if c in df.columns and c not in final_columns:
+                final_columns.append(c)
+    # Filet de sécurité : ajouter toute colonne oubliée
+    for c in df.columns:
+        if c not in final_columns:
+            final_columns.append(c)
+
+    df = df[final_columns]
+    disc_cols = {"Discordance_Nom", "Discordance_RCS", "Discordance_LEI"}
+
+    # ── Ligne 1 : bandeau disclaimer ────────────────────────────────────────
+    ws.cell(row=1, column=1, value=DISCLAIMER_TEXT)
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(final_columns))
+    c = ws.cell(row=1, column=1)
+    c.fill = PatternFill("solid", fgColor="FFF3CD")
+    c.font = Font(name="Calibri", bold=True, size=10, color="856404")
+    c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.row_dimensions[1].height = 32
+
+    # ── Ligne 2 : en-tête de bloc ───────────────────────────────────────────
+    col_pointer = 1
+    for block_name, cols, hdr_color in blocks:
+        block_cols_present = [c for c in cols if c in final_columns]
+        if not block_cols_present:
+            continue
+        n = len(block_cols_present)
+        ws.cell(row=2, column=col_pointer, value=block_name)
+        if n > 1:
+            ws.merge_cells(start_row=2, start_column=col_pointer,
+                           end_row=2, end_column=col_pointer + n - 1)
+        cell = ws.cell(row=2, column=col_pointer)
+        cell.fill = PatternFill("solid", fgColor=hdr_color)
+        cell.font = bold_white
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = border
+        col_pointer += n
+    ws.row_dimensions[2].height = 22
+
+    # ── Ligne 3 : noms de colonnes ──────────────────────────────────────────
+    for ci, cn in enumerate(final_columns, 1):
+        cell = ws.cell(row=3, column=ci, value=cn)
+        cell.fill = PatternFill("solid", fgColor="D9D9D9")
+        cell.font = bold_black
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        cell.border    = border
+        cell.border = border
+    ws.row_dimensions[3].height = 28
 
-    for ri, row in enumerate(df.itertuples(index=False), 2):
-        mt = getattr(row, "TypeCorrespondance", "")
-        if mt in ("Exact – RCS", "LEI Valide"):
-            rf = EXACT_FILL
-        elif mt == "Approx – RCS":
-            rf = APPROX_RCS_FILL
-        elif mt == "Approx – Nom/Pays":
-            rf = APPROX_FILL
-        elif mt == "LEI Discordant":
-            rf = DISCORD_FILL
-        elif mt in ("LEI Inconnu – GLEIF", "Non trouvé (LEI invalide)"):
-            rf = UNKNOWN_FILL
-        else:
-            rf = MISS_FILL
-
-        for ci, (cn, val) in enumerate(zip(columns, row), 1):
-            cell = ws.cell(row=ri, column=ci, value=val)
-            cell.font      = dfont
-            cell.border    = border
-            cell.alignment = Alignment(vertical="center")
-            if cn in gleif_cols:
-                cell.fill = rf
-            # Colonnes Disc_* : rouge gras si non vide
-            if cn in disc_cols and val:
-                cell.font = Font(name="Arial", size=10, color="C00000", bold=True)
-
-    col_widths = {
-        "LEI_GLEIF": 25, "GLEIF_NomLegal": 35, "GLEIF_Pays": 10,
-        "GLEIF_StatutSociete": 16, "GLEIF_StatutLEI": 14,
-        "GLEIF_AutoriteRegistre": 18, "GLEIF_NumRegistre": 20,
-        "GLEIF_DateRenouvellement": 22, "GLEIF_CodePostal": 18,
-        "TypeCorrespondance": 22, "ScoreCorrespondance": 12,
-        "Disc_LEI": 42, "Disc_RCS": 42, "Disc_Nom": 55,
-        "Disc_Date": 48, "Disc_CodePostal": 45,
+    # ── Lignes de données ───────────────────────────────────────────────────
+    fiab_to_fill = {
+        OK:         PatternFill("solid", fgColor=ROW_OK_FILL),
+        A_VERIFIER: PatternFill("solid", fgColor=ROW_VERIF_FILL),
+        KO:         PatternFill("solid", fgColor=ROW_KO_FILL),
     }
-    for ci, cn in enumerate(columns, 1):
-        ws.column_dimensions[get_column_letter(ci)].width = col_widths.get(cn, 22)
+    for ri, row in enumerate(df.itertuples(index=False), 4):
+        fiab = getattr(row, "Fiabilite", "")
+        row_fill = fiab_to_fill.get(fiab, PatternFill("solid", fgColor="FFFFFF"))
+        for ci, (cn, val) in enumerate(zip(final_columns, row), 1):
+            cell = ws.cell(row=ri, column=ci, value=val)
+            cell.font = base_font
+            cell.border = border
+            cell.alignment = Alignment(vertical="center", wrap_text=True)
+            cell.fill = row_fill
+            if cn in disc_cols and val:
+                cell.font = disc_font
+            if cn == "Fiabilite" and val:
+                cell.font = bold_black
+                cell.alignment = Alignment(horizontal="center", vertical="center")
 
-    ws.row_dimensions[1].height = 30
-    ws.freeze_panes = "A2"
+    # ── Largeurs de colonnes ────────────────────────────────────────────────
+    widths = {
+        "Nom_Source": 35, "Nom_GLEIF": 35, "Discordance_Nom": 50,
+        "RCS_Source": 22, "Pays_Source": 12,
+        "RCS_GLEIF": 22, "Pays_GLEIF": 12, "Discordance_RCS": 45,
+        "LEI_Source": 24, "LEI_GLEIF": 24,
+        "Statut_LEI_GLEIF": 16, "DateValidite_LEI_GLEIF": 22,
+        "Discordance_LEI": 45,
+        "TypeCorrespondance": 22, "Fiabilite": 14, "ActionRequise": 50,
+    }
+    for ci, cn in enumerate(final_columns, 1):
+        ws.column_dimensions[get_column_letter(ci)].width = widths.get(cn, 22)
 
-    ws_legend = wb.create_sheet("Légende")
-    legend_rows = [
-        ("Colonne",             "Description"),
-        ("LEI_Existant",        "LEI présent dans votre base (issu du fichier d'entrée)"),
-        ("LEI_GLEIF",           "LEI retourné par la base GLEIF (validé ou trouvé)"),
-        ("GLEIF_DateRenouvellement", "Date de prochaine échéance du LEI selon GLEIF"),
-        ("GLEIF_CodePostal",     "Code postal de l'entité tel qu'enregistré dans GLEIF"),
-        ("ScoreCorrespondance", "Score de correspondance : 'Nom:xx% / CP:✓' ou 'Nom:xx% / CP:✗' pour Approx Nom/Pays"),
+    ws.freeze_panes = "A4"
+
+    # ── Onglet Instructions ─────────────────────────────────────────────────
+    ws2 = wb.create_sheet("Instructions")
+    ws2.column_dimensions["A"].width = 28
+    ws2.column_dimensions["B"].width = 80
+
+    sg_red_font  = Font(name="Calibri", bold=True, size=14, color=SG_RED)
+    title_font   = Font(name="Calibri", bold=True, size=11, color=SG_BLACK)
+    section_font = Font(name="Calibri", bold=True, size=11, color="FFFFFF")
+
+    ws2.cell(1, 1, "SOCIÉTÉ GÉNÉRALE — Middle Office").font = sg_red_font
+    ws2.cell(2, 1, "GLEIF LEI Matcher — Mode d'emploi").font = title_font
+
+    rows = [
         ("", ""),
-        ("Colonnes Disc_* (rouge gras si anomalie détectée)", ""),
-        ("Disc_LEI",       "Anomalie sur le LEI : manquant côté client OU différent de GLEIF"),
-        ("Disc_RCS",       "Anomalie sur le RCS : manquant côté client OU différent (après normalisation)"),
-        ("Disc_Nom",       "Anomalie sur le nom : similarité fuzzy < seuil DQ (70 %)"),
-        ("Disc_Date",      "Anomalie sur la date LEI : manquante côté client OU différente de GLEIF"),
-        ("Disc_CodePostal","Anomalie sur le code postal :\n"
-         "  • Vrai écart : chiffres différents  ex: client='75001' ≠ GLEIF='1000'\n"
-         "  • Écart de format : chiffres identiques, libellé différent\n"
-         "    ex: client='1338' → GLEIF='L-1338' (à harmoniser dans votre référentiel)"),
+        ("⚠ DISCLAIMER",
+         "Cet outil est une AIDE À LA DÉCISION et non une vérité absolue. "
+         "Le rapprochement repose sur des heuristiques (normalisation, similarité fuzzy). "
+         "Toute correspondance qualifiée 'À vérifier' doit être validée manuellement "
+         "avant usage opérationnel ou réglementaire."),
         ("", ""),
-        ("Couleur",             "Signification du type de correspondance"),
-        ("Vert foncé",          "LEI validé (données cohérentes) ou correspondance exacte par RCS"),
-        ("Vert clair",          "Correspondance RCS approchée — le RCS client est contenu dans le RCS GLEIF (ex: zéro de tête manquant). ScoreCorrespondance = 'RCS:xx% / Nom:yy%'"),
-        ("Jaune",               f"Correspondance approximative nom/pays (score ≥ {threshold} %). ScoreCorrespondance inclut l'indicateur code postal si fourni."),
-        ("Orange",              "LEI Discordant — divergence détectée (LEI erroné, RCS/nom/CP différent)"),
-        ("Bleu clair",          "Non trouvé (LEI invalide) — introuvable même par RCS/nom"),
-        ("Rouge",               "Aucune correspondance trouvée (pas de LEI dans la base d'entrée)"),
+        ("FIABILITÉ — 3 niveaux", ""),
+        ("🟢 OK",
+         "Correspondance exacte (RCS + Pays cohérent) ou LEI validé sans discordance. "
+         "Aucune action requise."),
+        ("🟡 À vérifier",
+         "Correspondance approximative, ou pays source absent, ou écart résiduel détecté. "
+         "Action : vérification manuelle des libellés/pays."),
+        ("🔴 KO",
+         "LEI Discordant, ou aucune correspondance fiable trouvée. "
+         "Action : recherche manuelle sur https://www.gleif.org ou contact entité."),
         ("", ""),
-        ("Logique de détection",""),
-        ("1. LEI_Existant fourni + trouvé dans GLEIF",
-         "→ comparaison RCS / Nom / Date / Code Postal — Valide ou Discordant"),
-        ("2. LEI_Existant fourni + NON trouvé dans GLEIF",
-         "→ fallback par RCS puis nom/pays (avec code postal) pour retrouver l'entité\n"
-         "   Si trouvé : LEI Discordant (avec comparaison LEI_client vs LEI_GLEIF)\n"
-         "   Si introuvable : Non trouvé (LEI invalide)"),
-        ("3. Pas de LEI_Existant",
-         "→ RCS exact, puis RCS approché (contenance : RCS client ⊆ RCS GLEIF,\n"
-         "   ex: zéro de tête manquant), puis approximation nom+pays+code postal"),
+        ("BLOCS DU FICHIER", ""),
+        ("Données source",
+         "Vos colonnes d'origine, conservées intactes pour l'auditabilité."),
+        ("Bloc Identité",
+         "Comparaison nom légal source vs GLEIF + diagnostic de discordance."),
+        ("Bloc Légal",
+         "RCS source vs GLEIF + Pays source vs GLEIF. La règle v2.0 exige que le "
+         "RCS soit validé conjointement avec le pays — un même numéro de registre "
+         "dans deux pays différents ne produit plus de match silencieux."),
+        ("Bloc LEI",
+         "LEI source (si fourni) vs LEI GLEIF + statut + date de prochain "
+         "renouvellement."),
+        ("Synthèse",
+         "TypeCorrespondance (Exact, Approx, Discordant…), Fiabilité, et "
+         "ActionRequise — la colonne décisionnelle pour le Middle Office."),
         ("", ""),
-        ("Code postal",         ""),
-        ("Règle de contenance", "Les chiffres du code postal client doivent être contenus\n"
-         "dans le code postal GLEIF brut (ex: '1338' ⊆ 'L-1338').\n"
-         "CP:✓ = correspondance, CP:✗ = écart (signalé dans Disc_CodePostal)"),
+        ("LOGIQUE DE MATCHING", ""),
+        ("1. LEI fourni",
+         "Lookup direct dans GLEIF. Si introuvable : fallback RCS+Pays / Nom+Pays "
+         "pour proposer le bon LEI (résultat = LEI Discordant)."),
+        ("2. LEI absent — RCS+Pays exact",
+         "Index composite (RCS, Pays_ISO). Match strict, fiabilité = OK."),
+        ("3. LEI absent — RCS+Pays approché",
+         "Contenance par sous-chaîne (ex: '1513210151' ⊆ '01513210151'). "
+         "Restreint au pays cible si fourni."),
+        ("4. LEI absent — Nom+Pays approché",
+         f"Similarité fuzzy ≥ {threshold} % (token_sort_ratio), restreint au pays. "
+         "Si code postal fourni, préférence aux entités dont le CP correspond."),
+        ("", ""),
+        ("PARAMÈTRES PAR DÉFAUT", ""),
+        ("Seuil similarité nom",
+         f"{threshold} % — conservateur. Préférer un 'Non trouvé' à un faux positif."),
+        ("Seuil RCS approché",
+         "88 % — détecte les zéros de tête manquants et fautes mineures."),
+        ("Pays source absent",
+         "Le match RCS est accepté en mode dégradé (country-agnostic) mais la "
+         "fiabilité est forcée à 'À vérifier'."),
+        ("", ""),
+        ("STATISTIQUES DU LOT", ""),
+        ("Total lignes traitées",        f"{stats.get('total', 0):,}"),
+        ("OK (auto)",                    f"{stats.get('ok', 0):,}"),
+        ("À vérifier (manuel léger)",    f"{stats.get('a_verifier', 0):,}"),
+        ("KO (manuel approfondi)",       f"{stats.get('ko', 0):,}"),
     ]
-    for r, (a, b) in enumerate(legend_rows, 1):
-        ws_legend.cell(r, 1, a).font = Font(bold=(r == 1))
-        ws_legend.cell(r, 2, b).font = Font(bold=(r == 1))
-    ws_legend.column_dimensions["A"].width = 25
-    ws_legend.column_dimensions["B"].width = 65
+    r = 4
+    for k, v in rows:
+        c1 = ws2.cell(r, 1, k)
+        c2 = ws2.cell(r, 2, v)
+        if k.startswith(("FIABILITÉ", "BLOCS", "LOGIQUE", "PARAMÈTRES", "STATISTIQUES")):
+            c1.font = section_font
+            c1.fill = PatternFill("solid", fgColor=SG_RED)
+            ws2.merge_cells(start_row=r, start_column=1, end_row=r, end_column=2)
+            ws2.cell(r, 1).alignment = Alignment(horizontal="left", vertical="center")
+        elif k == "⚠ DISCLAIMER":
+            c1.font = Font(name="Calibri", bold=True, size=11, color="856404")
+            c2.font = Font(name="Calibri", size=10, color="856404")
+            c1.fill = c2.fill = PatternFill("solid", fgColor="FFF3CD")
+        else:
+            c1.font = Font(name="Calibri", bold=True, size=10)
+            c2.font = base_font
+        c1.alignment = Alignment(vertical="top", wrap_text=True)
+        c2.alignment = Alignment(vertical="top", wrap_text=True)
+        r += 1
 
     wb.save(output_path)
 
@@ -1591,35 +1427,29 @@ def _export_excel(df: pd.DataFrame, output_path: str, threshold: int) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _parse_args():
-    p = argparse.ArgumentParser(description="GLEIF LEI Matcher v1.2")
-    p.add_argument("--input",             required=True)
-    p.add_argument("--gleif",             required=True)
-    p.add_argument("--output",            required=True)
-    p.add_argument("--col-rcs",           default="RCS")
-    p.add_argument("--col-name",          default="NomEntreprise")
-    p.add_argument("--col-pays",          default="Pays")
-    p.add_argument("--col-lei",           default=None,
-                   help="Colonne LEI existant dans le fichier d'entrée (ex: LEI_Existant)")
-    p.add_argument("--col-date",          default=None,
-                   help="Colonne date validité LEI côté client (format dd-mm-yyyy, ex: LEI_DateValidite)")
-    p.add_argument("--col-postal",        default=None,
-                   help="Colonne code postal côté client (ex: CodePostal)")
-    p.add_argument("--fuzzy-threshold",     type=int, default=80,
-                   help="Seuil similarité nom/pays (défaut: 80)")
+    p = argparse.ArgumentParser(description="GLEIF LEI Matcher v2.0 — Middle Office Edition")
+    p.add_argument("--input",  required=True)
+    p.add_argument("--gleif",  required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--col-rcs",    default="RCS")
+    p.add_argument("--col-name",   default="NomEntreprise")
+    p.add_argument("--col-pays",   default="Pays")
+    p.add_argument("--col-lei",    default=None)
+    p.add_argument("--col-date",   default=None)
+    p.add_argument("--col-postal", default=None)
+    p.add_argument("--fuzzy-threshold",     type=int, default=90,
+                   help="Seuil similarité nom/pays (défaut 90)")
     p.add_argument("--rcs-fuzzy-threshold", type=int, default=88,
-                   help="Seuil similarité RCS approché (défaut: 88, 0=désactivé)")
-    p.add_argument("--active-only",         action="store_true", default=True)
-    p.add_argument("--all-statuses",      dest="active_only", action="store_false")
-    p.add_argument("--prepare-slim",      action="store_true",
-                   help="Préparer une base slim avant le matching")
-    p.add_argument("--slim-output",       default=None,
-                   help="Chemin du CSV slim (défaut : gleif_slim.csv à côté du fichier GLEIF)")
+                   help="Seuil RCS approché (défaut 88, 0=désactivé)")
+    p.add_argument("--active-only",  action="store_true", default=True)
+    p.add_argument("--all-statuses", dest="active_only", action="store_false")
+    p.add_argument("--prepare-slim", action="store_true")
+    p.add_argument("--slim-output",  default=None)
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
-
     gleif_path = args.gleif
     if args.prepare_slim:
         slim_path = args.slim_output or str(Path(args.gleif).parent / "gleif_slim.csv")
