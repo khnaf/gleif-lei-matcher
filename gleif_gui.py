@@ -618,7 +618,10 @@ class GleifApp(ctk.CTk):
         path = (self.v_gleif.get() or "").strip()
 
         if not path:
-            self._set_no_base_state("Aucune base sélectionnée. Cliquez sur 🔄 pour télécharger.")
+            self._set_no_base_state(
+                "🔄  Initialisation requise — cliquez sur « Mettre à jour » pour "
+                "télécharger la base GLEIF."
+            )
             return
 
         if not os.path.exists(path):
@@ -644,10 +647,11 @@ class GleifApp(ctk.CTk):
                         self.v_gleif.set(str(fallback))
                         return  # le trace re-déclenchera _refresh_data_validity()
 
-            # Aucun fallback possible → réinitialisation
+            # Aucun fallback possible → mode "Initialisation requise"
             self._set_no_base_state(
-                f"⚠️ Base non trouvée — Mise à jour requise\n"
-                f"   Chemin précédent : {path}"
+                f"🔄  Initialisation requise — la base GLEIF référencée a été "
+                f"supprimée ou déplacée.\n   Cliquez sur « Mettre à jour » pour "
+                f"la re-télécharger.\n   (Chemin précédent : {path})"
             )
             # On vide la préférence pour ne pas re-prompter à chaque sortie
             self.v_gleif.set("")
@@ -666,15 +670,15 @@ class GleifApp(ctk.CTk):
             pass
         try:
             self.btn_run.configure(
-                state="disabled", text="⚠️  Base GLEIF requise",
+                state="disabled", text="🔄  Initialisation requise",
                 fg_color=SG_GREY, hover_color=SG_GREY,
             )
         except AttributeError:
             pass  # btn_run pas encore créé pendant l'init
         try:
-            self.lbl_status_dot.configure(text_color=C_ERR)
-            self.lbl_status_text.configure(text="Aucune base GLEIF")
-            self.lbl_gleif_age.configure(text="Base introuvable", text_color=C_ERR)
+            self.lbl_status_dot.configure(text_color=C_WARN)
+            self.lbl_status_text.configure(text="Initialisation requise")
+            self.lbl_gleif_age.configure(text="Cliquez sur 🔄 Mettre à jour", text_color=C_WARN)
         except (AttributeError, Exception):
             pass
 
@@ -689,14 +693,21 @@ class GleifApp(ctk.CTk):
             pass
         try:
             # Ne ré-active que si l'utilisateur n'a pas déclenché un run
-            if self.btn_run.cget("text") in ("⚠️  Base GLEIF requise", "▶  LANCER LE RAPPROCHEMENT"):
+            if self.btn_run.cget("text") in (
+                "🔄  Initialisation requise",
+                "⚠️  Base GLEIF requise",  # libellé v2.2 (compat)
+                "▶  LANCER LE RAPPROCHEMENT",
+            ):
                 self.btn_run.configure(
                     state="normal", text="▶  LANCER LE RAPPROCHEMENT",
                     fg_color=SG_RED, hover_color=SG_RED_HOVER,
                 )
             self.lbl_status_msg.configure(text_color=SG_ANTHRACITE)
-            if "Base introuvable" in self.v_status.get() or "Aucune base" in self.v_status.get() \
-                    or "Base non trouvée" in self.v_status.get():
+            cur_status = self.v_status.get()
+            if any(kw in cur_status for kw in (
+                "Base introuvable", "Aucune base", "Base non trouvée",
+                "Initialisation requise",
+            )):
                 self.v_status.set("Prêt — sélectionnez vos fichiers et lancez le rapprochement.")
         except (AttributeError, Exception):
             pass

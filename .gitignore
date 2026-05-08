@@ -19,6 +19,14 @@ gleif_golden_copy*.csv
 gleif_golden_copy*.json
 gleif_golden_copy*.zip
 gleif_golden_copy_download.zip
+gleif_slim.csv
+gleif_cache.db
+gleif_cache.db-journal
+gleif_cache.db-wal
+gleif_cache.db-shm
+
+# Environnement portable (genere par setup_portable.py)
+.venv_portable/
 
 # OS
 .DS_Store
